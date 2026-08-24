@@ -949,8 +949,8 @@ PAGE = r"""<!DOCTYPE html>
      selectors too, so it wins over the blue/green accent those numbers normally take. */
   .neg, .card .stat .n.neg, .card.logged .stat .n.neg { color:var(--red); }
   .dash-updated { font-size:11px; color:var(--faint); white-space:nowrap; }
-  /* Budget bar: 20 discrete blocks of 5% rather than one continuous fill, so a glance
-     reads as a count ("14 of 20 blocks") instead of an eyeballed length. Green = room
+  /* Budget bar: 10 discrete blocks of 10% rather than one continuous fill, so a glance
+     reads as a count ("7 of 10 blocks") instead of an eyeballed length. Green = room
      left, gold = exactly at capacity, red = over. */
   .cap-bar { margin-top:14px; }
   .cap-wide { margin:0 0 18px; }   /* the bucket page's budget bar, under the stat strip */
@@ -1524,9 +1524,9 @@ function donutGrid(container, rows, opts){
     c.onclick = () => o.onPick(rows[+c.dataset.di]));
 }
 
-// The budget bar is drawn as CAP_BLOCKS discrete blocks (5% each): a block lights up for
-// every whole 5% of the monthly capacity spent, so the bar can be read as a count.
-const CAP_BLOCKS = 20, CAP_BLOCK_PCT = 100 / CAP_BLOCKS;
+// The budget bar is drawn as CAP_BLOCKS discrete blocks (10% each): a block lights up for
+// every whole 10% of the monthly capacity spent, so the bar can be read as a count.
+const CAP_BLOCKS = 10, CAP_BLOCK_PCT = 100 / CAP_BLOCKS;
 // True once a project/bucket has spent its whole monthly budget — the gold-tint trigger.
 const atCapacity = (hours, cap) => cap > 0 && Number(hours || 0) >= cap;
 function capBar(hours, cap){
