@@ -37,7 +37,7 @@ script works on GitHub Pages and throws a `ReferenceError` locally. The UI scrip
 
 ## Configuration lives at the top of `creative_asana_app.py`
 
-`PROJECTS`, `GROUPS`, `EXCLUDE_ESTIMATED`, `EST_FIELD`, `EXCLUDE_SECTIONS`, `ASSIGNEE_HOURS_CAP`, `TEAM_MEMBERS`,
+`PROJECTS`, `GROUPS`, `ARCHIVED_GIDS`, `EST_FIELD`, `EXCLUDE_SECTIONS`, `ASSIGNEE_HOURS_CAP`, `TEAM_MEMBERS`,
 `DEFAULT_START`/`DEFAULT_END`. `build_static.py` imports these and injects them into the static
 build, so **adding a project or team member is a one-line change plus a rebuild.** Never
 duplicate a project list or a team roster anywhere else.
@@ -45,10 +45,13 @@ duplicate a project list or a team roster anywhere else.
 - A project's `cap` is its **monthly hour capacity**; omit it for projects with no budget.
 - `GROUPS` are several projects sharing one combined monthly cap (e.g. CMD). Members still
   appear individually in every other tab.
-- `EXCLUDE_ESTIMATED` is the set of project gids dropped from every **Estimated Hours** view
-  (they still appear in Actual Hours). `EST_PROJECTS` is `PROJECTS` minus that set — the
-  estimated aggregations (`get_summaries`, `get_assignee_load` / `getSummaries`,
-  `getAssigneeLoad`) map over it, the logged ones over all of `PROJECTS`.
+- `ARCHIVED_GIDS` is the set of archived project gids. They still appear on the card/list
+  tabs (Project Cards, MSA Project Capacity), but under an **Archived projects** section
+  below the active work and outside the summary stats — the UI splits them off via the
+  injected `ARCHIVED_GIDS` / `isArchived()`. They are excluded from the aggregate estimated
+  views: `EST_PROJECTS` is `PROJECTS` minus that set, and `get_assignee_load` /
+  `getAssigneeLoad` map over it (which is what Team Capacity · Estimated and Bar Chart ·
+  Estimated are built from). Every other endpoint keeps all of `PROJECTS`.
 
 ## Running it
 

@@ -19,8 +19,7 @@ import creative_asana_app as a
 
 PROJECTS = json.dumps(a.PROJECTS)
 EST_PROJECTS = json.dumps(a.EST_PROJECTS)
-EXCL_CAP = json.dumps(sorted(a.EXCLUDE_CAPACITY))
-ARCHIVED = json.dumps(a.ARCHIVED_PROJECTS)
+ARCHIVED = json.dumps(sorted(a.ARCHIVED_GIDS))
 GROUPS = json.dumps(a.GROUPS)
 EST_FIELD = json.dumps(a.EST_FIELD)
 EXCLUDE = json.dumps(sorted(a.EXCLUDE_SECTIONS))
@@ -41,11 +40,9 @@ const PROJECTS = __PROJECTS__;
 // The Estimated Hours views aggregate over this subset (see EXCLUDE_ESTIMATED in
 // creative_asana_app.py); Actual Hours keeps every project.
 const EST_PROJECTS = __ESTPROJECTS__;
-// Projects the MSA Project Capacity tab hides (see EXCLUDE_CAPACITY in creative_asana_app.py).
-// The UI script reads this, so the local app's boot script injects it too.
-const EXCLUDE_CAPACITY = __EXCLCAP__;
-// The roster behind the Archived projects tab: everything the main views exclude.
-const ARCHIVED_PROJECTS = __ARCHIVED__;
+// Archived project gids (see ARCHIVED_GIDS in creative_asana_app.py). The UI script reads
+// this, so the local app's boot script injects it too.
+const ARCHIVED_GIDS = __ARCHIVED__;
 const GROUPS = __GROUPS__;
 const DEF_START = __DEFSTART__, DEF_END = __DEFEND__;
 const PROJECT_ROSTER = PROJECTS.map(p => p.name);
@@ -290,7 +287,7 @@ async function projectDetail(gid, refresh){
     counts: ordered.map(n => counts[n]), ntasks: detailed.length, tasks: detailed, updated: nowStr() };
 }
 
-const CACHE = { summaries: null, archived: null, detail: {}, logged_summaries: {}, logged_detail: {}, me: null };
+const CACHE = { summaries: null, detail: {}, logged_summaries: {}, logged_detail: {}, me: null };
 // Mirrors get_me: the display name behind the PAT, so the UI can default a filter to "you".
 // asanaGet always hands back an array, and /users/me is a single object, so take the first.
 async function getMe(refresh){
@@ -309,7 +306,7 @@ async function getDetail(gid, refresh){
 }
 async function getSummaries(refresh){
   if (!refresh && CACHE.summaries) return CACHE.summaries;
-  const details = await mapAll(EST_PROJECTS, p => getDetail(p.gid, refresh));
+  const details = await mapAll(PROJECTS, p => getDetail(p.gid, refresh));
   return (CACHE.summaries = details.map(summaryFromDetail));
 }
 // Task/subtask rows assigned to `name` within one project detail (est/actual/remaining + status).
@@ -325,12 +322,6 @@ function assigneeProjectTasks(d, name){
     }
   }
   return rows;
-}
-// Mirrors get_archived_summaries(): the same widgets, over the archived roster.
-async function getArchived(refresh){
-  if (!refresh && CACHE.archived) return CACHE.archived;
-  const details = await mapAll(ARCHIVED_PROJECTS, p => getDetail(p.gid, refresh));
-  return (CACHE.archived = details.map(summaryFromDetail));
 }
 async function getAssigneeLoad(refresh){
   const details = await mapAll(EST_PROJECTS, p => getDetail(p.gid, refresh));
@@ -472,7 +463,6 @@ async function handleApi(p){
   if (path === '/api/projects') return getSummaries(refresh);
   if (path === '/api/logged') return getLoggedSummaries(refresh, start, end);
   if (path === '/api/assignees') return getAssigneeLoad(refresh);
-  if (path === '/api/archived') return getArchived(refresh);
   if (path === '/api/groups') return GROUPS;
   if (path === '/api/me') return getMe(refresh);
   if (path.startsWith('/api/logged/')) return getLoggedDetail(path.split('/').pop(), refresh, start, end);
@@ -576,7 +566,6 @@ def build():
                .replace('__TEAM__', TEAM)
                .replace('__PROJECTS__', PROJECTS)
                .replace('__ESTPROJECTS__', EST_PROJECTS)
-               .replace('__EXCLCAP__', EXCL_CAP)
                .replace('__ARCHIVED__', ARCHIVED)
                .replace('__GROUPS__', GROUPS)
                .replace('__DEFSTART__', DEF_START)
