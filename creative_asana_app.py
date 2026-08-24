@@ -76,9 +76,22 @@ EXCLUDE_ESTIMATED = {
     "1214228966572568",   # Brain Dump
     "1214755322546416",   # Project Twilight
     "1214228966572573",   # Autotask Reporting
+    "1214228966572578",   # Claude: Discovery and Engineering
+}
+# Projects hidden from the MSA Project Capacity tab (its "Other projects" list) — internal
+# work with no retainer behind it, which only made the budget picture noisier. They still
+# appear in every other Actual Hours view. Injected into the UI script by both deploy paths.
+EXCLUDE_CAPACITY = {
+    "1214228966572568",   # Brain Dump
+    "1214228966572578",   # Claude: Discovery and Engineering
 }
 # The project list every Estimated Hours view aggregates over. Actual Hours keeps all PROJECTS.
 EST_PROJECTS = [p for p in PROJECTS if p["gid"] not in EXCLUDE_ESTIMATED]
+
+# Everything the main views leave out, gathered into one roster for the "Other projects ·
+# Archived projects" tab, so a project excluded above is still reported somewhere.
+ARCHIVED_GIDS = EXCLUDE_ESTIMATED | EXCLUDE_CAPACITY
+ARCHIVED_PROJECTS = [p for p in PROJECTS if p["gid"] in ARCHIVED_GIDS]
 
 EST_FIELD = "Estimated time"             # stored in minutes
 EXCLUDE_SECTIONS = {"completed"}         # status columns excluded from hour totals (case-insensitive)
@@ -95,7 +108,7 @@ PROJECT_CAPS = {p["gid"]: p.get("cap") for p in PROJECTS}   # monthly hour capac
 # In-memory cache so navigating between pages never re-hits the Asana API.
 # Data is fetched once and reused until the user explicitly clicks Refresh.
 # The "hours logged" caches are keyed by month: {month: ...}.
-CACHE = {"summaries": None, "detail": {}, "logged_summaries": {}, "logged_detail": {}, "me": None,
+CACHE = {"summaries": None, "archived": None, "detail": {}, "logged_summaries": {}, "logged_detail": {}, "me": None,
          # Raw Asana reads, shared by both halves of the app so nothing is fetched twice:
          #   tree    = {project gid: {tasks, subs, at}}   entries = {task gid: {rows, at}}
          "tree": {}, "entries": {}}
@@ -619,6 +632,25 @@ def get_summaries(refresh=False):
     out = [summary_from_detail(d) for d in details]
     with CACHE_LOCK:
         CACHE["summaries"] = out
+    return out
+
+
+def get_archived_summaries(refresh=False):
+    """Dashboard widgets for the archived roster (ARCHIVED_PROJECTS).
+
+    Same shape as get_summaries, just over the projects the Estimated Hours and MSA
+    Project Capacity views exclude. Reuses the same per-project detail cache, so opening
+    the tab costs nothing once a project has been loaded by either half of the app.
+    """
+    if not refresh:
+        with CACHE_LOCK:
+            cached = CACHE["archived"]
+        if cached is not None:
+            return cached
+    details = PROJECT_POOL.map(lambda p: get_detail(p["gid"], refresh=refresh), ARCHIVED_PROJECTS)
+    out = [summary_from_detail(d) for d in details]
+    with CACHE_LOCK:
+        CACHE["archived"] = out
     return out
 
 
@@ -1645,6 +1677,8 @@ const TABS = {
     sub:'Every task worked on in the selected range, grouped by project.' },
   actualdaily: { label:'Daily Log', title:'Daily Log · Logged',
     sub:'Day by day, what each person logged their time to in the selected range.' },
+  archived: { label:'Archived projects', title:'Archived projects',
+    sub:'Projects kept out of the Estimated Hours views and the MSA capacity budgets — still reported here, with their remaining estimated hours and anything logged in the selected range.' },
   settings: { label:'Graph Colors', title:'Graph Colors',
     sub:'Pick a color for each person — saved in this browser and applied to every per-person chart.' },
 };
@@ -1653,6 +1687,7 @@ const TABS = {
 const NAV_SECTIONS = [
   { title: 'Estimated Hours', tone: 'est', tabs: ['team', 'estproj', 'estimated'] },
   { title: 'Actual Hours', tone: 'act', tabs: ['teamactual', 'capacity', 'actualproj', 'actualitems', 'actualdaily'] },
+  { title: 'Other projects', tabs: ['archived'] },
   { title: 'Settings', tabs: ['settings'] },
 ];
 
@@ -1790,6 +1825,8 @@ async function renderDashboard() {
   let itemStatsCache = {};     // Actual Hours per-item (task) totals, keyed by 'start:end'
   let dailyStatsCache = {};    // Actual Hours per-person/per-day task rows, keyed by 'start:end'
   let personLoading = {};      // in-flight guard so the chart + summary don't double-fetch
+  let archivedData = null;     // Archived projects tab (fetched the first time it's opened)
+  let archivedLoading = false;
 
   // Wire the date-range Search button (if the current tab rendered one). Editing the date
   // fields does nothing until Search is clicked (or Enter is pressed in a field).
@@ -2713,6 +2750,7 @@ async function renderDashboard() {
     if (!el) return;
     let u = null;
     if (dashTab === 'settings') u = null;
+    else if (dashTab === 'archived') u = archivedData && archivedData[0] && archivedData[0].updated;
     else if (dashTab === 'team') u = teamData && teamData.updated;
     else if (dashTab === 'estimated' || dashTab === 'estproj') u = estData && estData[0] && estData[0].updated;
     else u = loggedData && loggedData[0] && loggedData[0].updated;
@@ -2762,11 +2800,15 @@ async function renderDashboard() {
         // budget buckets first, then any standalone capped project (group members roll into
         // their bucket). Everything else that logged hours follows as plain statistics cards.
         const memberGids = new Set((groupsConfig || []).flatMap(g => g.gids));
-        const groups = (groupsConfig || []).map(g => buildGroupSummary(g, loggedData))
+        // Internal projects with no retainer behind them (EXCLUDE_CAPACITY) never show up
+        // here — including in the headline stats, which are budget numbers.
+        const capHidden = new Set(EXCLUDE_CAPACITY);
+        const capRows = loggedData.filter(w => !capHidden.has(w.gid));
+        const groups = (groupsConfig || []).map(g => buildGroupSummary(g, capRows))
                          .filter(g => g.members.length);
-        const standalone = loggedData.filter(w => w.cap != null && !memberGids.has(w.gid))
+        const standalone = capRows.filter(w => w.cap != null && !memberGids.has(w.gid))
                              .sort((a, b) => b.hours - a.hours);
-        const others = loggedData.filter(w => w.cap == null && !memberGids.has(w.gid))
+        const others = capRows.filter(w => w.cap == null && !memberGids.has(w.gid))
                          .sort((a, b) => b.hours - a.hours);
         const hasCap = groups.length || standalone.length;
         // Headline stats cover the budgeted work only — the retainer picture in one line.
@@ -2804,9 +2846,60 @@ async function renderDashboard() {
         }
         wireRangeSel();
       }
+    } else if (dashTab === 'archived') {
+      renderArchived();
     } else if (dashTab === 'settings') {
       renderSettings();
     }
+  }
+
+  // Other projects › Archived projects: the roster the main views deliberately leave out
+  // (ARCHIVED_PROJECTS server-side). Estimated hours and logged hours are shown as two
+  // grids of the standard cards, so each keeps its own blue/green semantics.
+  async function loadArchived(refresh) {
+    if (archivedLoading) return;
+    archivedLoading = true;
+    try {
+      archivedData = await fetch('/api/archived' + (refresh ? '?refresh=1' : '')).then(r => r.json());
+    } catch (err) {
+      if (dashTab === 'archived') view.innerHTML = fmtErr(err);
+      return;
+    } finally { archivedLoading = false; }
+    if (dashTab === 'archived') renderTab();
+  }
+
+  function renderArchived() {
+    if (!archivedData) {
+      view.innerHTML = rangePicker() + note(LOADING);
+      wireRangeSel(); loadArchived(false); return;
+    }
+    const est = [...archivedData].sort((a, b) => (b.hours || 0) - (a.hours || 0));
+    const gids = new Set(est.map(w => w.gid));
+    const logged = (loggedData || []).filter(w => gids.has(w.gid))
+                     .sort((a, b) => (b.hours || 0) - (a.hours || 0));
+    const totEst = est.reduce((a, w) => a + (w.hours || 0), 0);
+    const totLog = logged.reduce((a, w) => a + (w.hours || 0), 0);
+    view.innerHTML = summaryBar([
+      { n: est.length, l: est.length === 1 ? 'Archived project' : 'Archived projects' },
+      { n: h2(totLog) + ' h', l: 'Hours logged' },
+      { n: h2(totEst) + ' h', l: 'Estimated remaining' },
+      { n: est.reduce((a, w) => a + (w.ntasks || 0), 0), l: 'Open tasks' },
+    ]) + rangePicker();
+    wireRangeSel();
+    const grid = (rows, make) => {
+      const g = document.createElement('div');
+      g.className = 'grid';
+      rows.forEach(w => g.appendChild(make(w)));
+      view.appendChild(g);
+    };
+    view.insertAdjacentHTML('beforeend', '<h2 class="section-h flush">Estimated hours</h2>');
+    if (est.length) grid(est, estCard);
+    else view.insertAdjacentHTML('beforeend', note('No archived projects.'));
+    view.insertAdjacentHTML('beforeend',
+      `<h2 class="section-h">Hours logged · ${esc(rangeLabel(dateStart, dateEnd))}</h2>`);
+    if (logged.some(w => w.hours > 0)) grid(logged.filter(w => w.hours > 0), loggedCard);
+    else view.insertAdjacentHTML('beforeend',
+      note(`No hours logged against these projects in ${rangeLabel(dateStart, dateEnd)}.`));
   }
 
   // Settings: per-person graph colors. Choices persist to localStorage (see personColor)
@@ -2850,7 +2943,7 @@ async function renderDashboard() {
       loggedData = j;
     } catch (err) { view.innerHTML = fmtErr(err); return; }
     await mePromise;   // so Daily Log knows who "you" are before it picks its default assignee
-    if (['capacity', 'actualproj', 'actualitems', 'actualdaily', 'teamactual'].includes(dashTab)) renderTab();
+    if (['capacity', 'actualproj', 'actualitems', 'actualdaily', 'teamactual', 'archived'].includes(dashTab)) renderTab();
   }
 
   // Who owns the token, resolved once at startup and awaited before any render that could
@@ -2873,6 +2966,7 @@ async function renderDashboard() {
         loadLogged(refresh),
       ]);
       estData = e; groupsConfig = grp;
+      if (refresh) archivedData = null;   // rebuilt (from the now-warm detail cache) on next open
       // Team load derives from the per-project detail that /api/projects just (re)built,
       // so it reads the warm cache — no refresh flag, no duplicate Asana pulls.
       teamData = await fetch('/api/assignees').then(r => r.json());
@@ -3259,8 +3353,10 @@ route();
 # injects via its PREPEND. When serving the page ourselves we inject the same values here,
 # in a <script> that runs before the UI script, so identifiers like TEAM_MEMBERS are defined.
 def render_page():
-    boot = ("<script>\nconst TEAM_MEMBERS = %s;\nconst PROJECT_ROSTER = %s;\n</script>\n"
-            % (json.dumps(TEAM_MEMBERS), json.dumps([p["name"] for p in PROJECTS])))
+    boot = ("<script>\nconst TEAM_MEMBERS = %s;\nconst PROJECT_ROSTER = %s;\n"
+            "const EXCLUDE_CAPACITY = %s;\n</script>\n"
+            % (json.dumps(TEAM_MEMBERS), json.dumps([p["name"] for p in PROJECTS]),
+               json.dumps(sorted(EXCLUDE_CAPACITY))))
     return PAGE.replace('<div class="wrap" id="app"></div>\n<script>',
                         '<div class="wrap" id="app"></div>\n' + boot + '<script>', 1)
 
@@ -3284,6 +3380,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, get_summaries(refresh=refresh))
             if path == "/api/logged":
                 return self._json(200, get_logged_summaries(refresh=refresh, start=start, end=end))
+            if path == "/api/archived":
+                return self._json(200, get_archived_summaries(refresh=refresh))
             if path == "/api/assignees":
                 return self._json(200, get_assignee_load(refresh=refresh))
             if path == "/api/groups":
