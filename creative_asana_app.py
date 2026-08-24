@@ -916,7 +916,10 @@ PAGE = r"""<!DOCTYPE html>
           --text:#edeff2; --muted:#a3aab4; --faint:#737b86;
           /* capacity gold — the same reserved hue as C.amber; only ever used for
              "this budget is spent" signals, never as a data color. */
-          --amber:#f0c674; --amber-line:#7d6a3c; --amber-tint:#2c281d; }
+          --amber:#f0c674; --amber-line:#7d6a3c; --amber-tint:#2c281d;
+          /* Unspent blocks on a budget bar. Deliberately lighter than --panel2, which is the
+             background of the capacity cards the bar sits on — at --panel2 it disappeared. */
+          --blk-off:#5b6474; }
   body { font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin:0; background:var(--bg); color:var(--text); }
   .wrap { max-width:1040px; margin:32px auto; padding:0 20px; }
   h1 { font-size:22px; margin:0 0 2px; }
@@ -946,7 +949,7 @@ PAGE = r"""<!DOCTYPE html>
   .cap-bar { margin-top:14px; }
   .cap-wide { margin:0 0 18px; }   /* the bucket page's budget bar, under the stat strip */
   .cap-bar .track { display:flex; gap:2px; }
-  .cap-bar .blk { flex:1 1 0; height:9px; border-radius:2px; background:var(--panel2); }
+  .cap-bar .blk { flex:1 1 0; height:9px; border-radius:2px; background:var(--blk-off); }
   .cap-bar .blk.on { background:var(--green); }
   .cap-bar.at .blk.on { background:var(--amber); }
   .cap-bar.over .blk.on { background:var(--red); }
