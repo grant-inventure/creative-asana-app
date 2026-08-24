@@ -1238,10 +1238,12 @@ const capLinePlugin = {
 };
 Chart.register(capLinePlugin);
 
-// Team Capacity bar color: green when a person lands within CAP_TOLERANCE hours of the
-// target (i.e. appropriately loaded), red when they are under- or over-booked past it.
-const CAP_TOLERANCE = 15;
-const capColor = (h, cap) => Math.abs(h - cap) <= CAP_TOLERANCE ? C.green : C.red;
+// Team Capacity · Logged bar color: measured against the PACE target (where a person should
+// be by today), not the whole month's cap — that is the number a PM acts on mid-month. Green
+// means keeping pace: at or above the target, or no more than PACE_TOLERANCE hours short of
+// it. Red means far enough behind to need attention.
+const PACE_TOLERANCE = 5;
+const capColorPace = (h, paceTarget) => h >= paceTarget - PACE_TOLERANCE ? C.green : C.red;
 // Team Capacity · Estimated uses a flat threshold instead of the tolerance band: a person
 // carrying more than CAP_GREEN_MIN remaining hours is booked up (green); anyone below it has
 // room and needs work assigned (red).
@@ -1647,7 +1649,7 @@ const TABS = {
   estimated: { label:'Project Cards', title:'Project Cards · Estimated',
     sub:'One card per project: estimated hours still on the board and how many tasks they sit in.' },
   teamactual: { label:'Team Capacity', title:'Team Capacity · Logged',
-    sub:'Hours actually logged per person in the selected range, against the monthly target. The amber line is where each person should be today, based on how far through the work month (Mon–Fri) we are.' },
+    sub:'Hours actually logged per person in the selected range, against the monthly target. The amber line is where each person should be today, based on how far through the work month (Mon–Fri) we are — a bar is green when it is at that line or within 5 h of it, red when it falls further behind.' },
   capacity: { label:'MSA Project Capacity', title:'MSA Project Capacity · Logged',
     sub:'Hours logged against each retainer budget for the selected range, with what is left.' },
   actualproj: { label:'Bar Chart', title:'Projects · Logged',
@@ -2619,7 +2621,7 @@ async function renderDashboard() {
     }
     destroyCharts();
     const labels = rows.map(r => r.name), totals = rows.map(r => r.total);
-    const colors = totals.map(h => capColor(h, cap));
+    const colors = totals.map(h => capColorPace(h, paceTarget));
     chart = new Chart(document.getElementById('chart'), {
       type: 'bar',
       data: { labels, datasets: [{ label: 'Hours logged', data: totals,
@@ -2640,7 +2642,9 @@ async function renderDashboard() {
           tooltip: { callbacks: {
             label: ctx => `Logged: ${h2(ctx.parsed.y)} h of ${h2(cap)} (${(ctx.parsed.y / cap * 100).toFixed(0)}%)`,
             afterLabel: ctx => paceTarget
-              ? `Target by today ${h2(paceTarget)} h · ${(ctx.parsed.y / paceTarget * 100).toFixed(0)}% of pace`
+              ? `Target by today ${h2(paceTarget)} h · ${(ctx.parsed.y / paceTarget * 100).toFixed(0)}% of pace` +
+                ` · ${ctx.parsed.y >= paceTarget - PACE_TOLERANCE ? 'on pace'
+                       : h2(paceTarget - ctx.parsed.y) + ' h behind'}`
               : '' } } } }
     });
     // One donut per person under the bars: which projects they logged their hours against.
