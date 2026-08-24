@@ -18,6 +18,7 @@ import json
 import creative_asana_app as a
 
 PROJECTS = json.dumps(a.PROJECTS)
+EST_PROJECTS = json.dumps(a.EST_PROJECTS)
 GROUPS = json.dumps(a.GROUPS)
 EST_FIELD = json.dumps(a.EST_FIELD)
 EXCLUDE = json.dumps(sorted(a.EXCLUDE_SECTIONS))
@@ -35,6 +36,9 @@ const EXCLUDE_SECTIONS = new Set(__EXCLUDE__);
 const ASSIGNEE_HOURS_CAP = __CAP__;
 const TEAM_MEMBERS = __TEAM__;
 const PROJECTS = __PROJECTS__;
+// The Estimated Hours views aggregate over this subset (see EXCLUDE_ESTIMATED in
+// creative_asana_app.py); Actual Hours keeps every project.
+const EST_PROJECTS = __ESTPROJECTS__;
 const GROUPS = __GROUPS__;
 const DEF_START = __DEFSTART__, DEF_END = __DEFEND__;
 const PROJECT_ROSTER = PROJECTS.map(p => p.name);
@@ -50,12 +54,42 @@ function nowStr(){ const d = new Date(), p = n => String(n).padStart(2, '0');
   const h24 = d.getHours(), ap = h24 < 12 ? 'AM' : 'PM', h12 = h24 % 12 || 12;
   return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(h12)}:${p(d.getMinutes())}:${p(d.getSeconds())} ${ap}`; }
 
-// Bound real network concurrency (Asana rate limits + browser per-host caps).
+// Bound real network concurrency. The limit that matters is Asana's per-token rate limit, not
+// the socket: HTTP/2 multiplexes, and every call from the browser costs a CORS preflight on top
+// (the Authorization header makes it a non-simple request), so round trips are what hurt. Start
+// wide and halve on the first 429 — being conservative up front just makes every load slow.
+let MAX_ACTIVE = 24;
+// The real ceiling is Asana's per-token rate limit (1500 requests/minute on paid plans, 150 on
+// free), not concurrency — so pace requests with a token bucket just under it and let
+// concurrency float. Both halve on a 429, so a free-tier token settles instead of thrashing.
+let RATE_PER_SEC = 20;                 // 1200/min, comfortably under the paid-plan limit
+let _tokens = RATE_PER_SEC, _lastFill = Date.now();
+async function _takeToken(){
+  for (;;){
+    const now = Date.now();
+    _tokens = Math.min(RATE_PER_SEC, _tokens + (now - _lastFill) / 1000 * RATE_PER_SEC);
+    _lastFill = now;
+    if (_tokens >= 1){ _tokens -= 1; return; }
+    await new Promise(s => setTimeout(s, Math.ceil((1 - _tokens) / RATE_PER_SEC * 1000)));
+  }
+}
+let _throttled = false;
+function backOff(){
+  MAX_ACTIVE = Math.max(4, Math.floor(MAX_ACTIVE / 2));
+  RATE_PER_SEC = Math.max(2, RATE_PER_SEC / 2);
+  if (!_throttled){
+    _throttled = true;
+    console.warn('Asana rate-limited this token (429) — pacing reduced to ' + RATE_PER_SEC
+      + ' requests/sec, ' + MAX_ACTIVE + ' at a time.');
+  }
+}
 let _active = 0; const _waiters = [];
 function _gate(fn){
   return new Promise((resolve, reject) => {
-    const run = () => { _active++; fn().then(resolve, reject).finally(() => { _active--; const n = _waiters.shift(); if (n) n(); }); };
-    if (_active < 8) run(); else _waiters.push(run);
+    const run = () => { _active++;
+      _takeToken().then(fn).then(resolve, reject)
+        .finally(() => { _active--; const n = _waiters.shift(); if (n) n(); }); };
+    if (_active < MAX_ACTIVE) run(); else _waiters.push(run);
   });
 }
 
@@ -67,7 +101,7 @@ async function asanaGet(pathOrUrl){
     const page = await _gate(async () => {
       for (;;){
         const r = await _realFetch(full, { headers: { Authorization: 'Bearer ' + TOKEN } });
-        if (r.status === 429){ const ra = Number(r.headers.get('Retry-After') || 1); await new Promise(s => setTimeout(s, ra * 1000)); continue; }
+        if (r.status === 429){ backOff(); const ra = Number(r.headers.get('Retry-After') || 1); await new Promise(s => setTimeout(s, ra * 1000)); continue; }
         if (!r.ok) throw new Error('Asana ' + r.status);
         return r.json();
       }
@@ -98,27 +132,61 @@ async function asanaPost(path, body){
 // that failed or has a second page — falls back to a plain GET, so batching can cost requests
 // but can never lose rows.
 const BATCH_MAX = 10;
-// Warn once if batching isn't working: the load still completes (each read falls back to its
-// own GET) but at ~10x the requests, which is the difference between a fast and a slow start.
-let _batchWarned = false;
-function warnBatch(why){
-  if (_batchWarned) return;
-  _batchWarned = true;
+// Asana accepts two shapes for a batch action: the query string inline in relative_path, or the
+// path bare with `options` alongside. Workspaces differ in what they accept, so try the inline
+// form, fall back to the structured form, and only then give up on batching for the session —
+// escalating once, not once per chunk, so a rejection can't cost hundreds of wasted POSTs.
+const BATCH_MODES = ['path', 'options', 'off'];
+let _batchMode = 0;
+function batchAction(p, mode){
+  if (mode === 'path') return { method: 'get', relative_path: p };
+  const [base, qs] = p.split('?');
+  const q = new URLSearchParams(qs || '');
+  const options = {};
+  if (q.get('opt_fields')) options.fields = q.get('opt_fields').split(',');
+  if (q.get('limit')) options.limit = Number(q.get('limit'));
+  return { method: 'get', relative_path: base, options };
+}
+function batchOff(why){
+  if (BATCH_MODES[_batchMode] === 'off') return;
+  _batchMode = BATCH_MODES.length - 1;
   console.warn('Asana /batch_requests unavailable (' + why + ') — falling back to one request '
     + 'per read, so this load will be slow. Data is unaffected.');
+}
+async function batchTry(paths, mode){
+  // Returns the action results, or {bad} if this shape didn't work at all. A 404 on the endpoint
+  // itself (some accounts don't have /batch_requests at all) is fatal for every shape.
+  try {
+    const res = await asanaPost('/batch_requests',
+      { data: { actions: paths.map(p => batchAction(p, mode)) } });
+    const results = res && res.data;
+    if (!Array.isArray(results) || results.length !== paths.length) return { bad: 'response shape' };
+    // Every action failing points at the request shape — but only if there were several. A
+    // small batch can fail outright for ordinary reasons (a deleted task), and that must not be
+    // read as "batching is broken"; those paths just fall back individually below.
+    if (paths.length >= 3 && results.every(r => !r || r.status_code !== 200)) {
+      const first = results[0] || {};
+      const msg = ((first.body || {}).errors || [{}])[0].message || ('status ' + first.status_code);
+      return { bad: msg, results };
+    }
+    return { results };
+  } catch (err) {
+    const msg = String((err && err.message) || err);
+    return { bad: msg, fatal: /40[34]|Failed to fetch|NetworkError/i.test(msg) };
+  }
 }
 async function asanaBatchChunk(paths){
   const out = {};
   let results = null;
-  try {
-    const res = await asanaPost('/batch_requests',
-      { data: { actions: paths.map(p => ({ method: 'get', relative_path: p })) } });
-    results = res && res.data;
-    if (!Array.isArray(results) || results.length !== paths.length){
-      warnBatch('unexpected response shape');
-      results = null;
-    }
-  } catch (err) { warnBatch(String((err && err.message) || err)); results = null; }
+  while (BATCH_MODES[_batchMode] !== 'off'){
+    const attempt = await batchTry(paths, BATCH_MODES[_batchMode]);
+    if (!attempt.bad){ results = attempt.results; break; }
+    // Every action failed: this shape is not supported here. Try the next one, then stop —
+    // unless the endpoint itself is missing or blocked, where no shape can help.
+    if (attempt.fatal || BATCH_MODES[_batchMode + 1] === 'off') batchOff(attempt.bad);
+    else { console.warn('Asana batch shape "' + BATCH_MODES[_batchMode] + '" rejected (' +
+      attempt.bad + ') — trying the next shape.'); _batchMode++; }
+  }
   if (!results){
     for (const [i, rows] of (await mapAll(paths, asanaGet)).entries()) out[paths[i]] = rows;
     return out;
@@ -130,11 +198,26 @@ async function asanaBatchChunk(paths){
   });
   return out;
 }
+// Send the very first chunk on its own and wait for it: if this account has no /batch_requests
+// endpoint, that costs exactly one wasted request to find out, rather than a whole parallel wave
+// of them all discovering it at once. Everything after the probe goes out in parallel.
+let _batchProbe = null;
 async function asanaBatch(paths){
   paths = [...paths];
   const chunks = [];
   for (let i = 0; i < paths.length; i += BATCH_MAX) chunks.push(paths.slice(i, i + BATCH_MAX));
-  return Object.assign({}, ...await mapAll(chunks, asanaBatchChunk));
+  const out = {};
+  if (!chunks.length) return out;
+  if (!_batchProbe){
+    let first;
+    _batchProbe = (async () => { first = await asanaBatchChunk(chunks[0]); })();
+    await _batchProbe;
+    Object.assign(out, first);
+    chunks.shift();
+  } else {
+    await _batchProbe;
+  }
+  return Object.assign(out, ...await mapAll(chunks, asanaBatchChunk));
 }
 
 // ---- Estimated-hours layer (mirrors project_detail / get_summaries / get_assignee_load) ----
@@ -219,7 +302,7 @@ async function getDetail(gid, refresh){
 }
 async function getSummaries(refresh){
   if (!refresh && CACHE.summaries) return CACHE.summaries;
-  const details = await mapAll(PROJECTS, p => getDetail(p.gid, refresh));
+  const details = await mapAll(EST_PROJECTS, p => getDetail(p.gid, refresh));
   return (CACHE.summaries = details.map(summaryFromDetail));
 }
 // Task/subtask rows assigned to `name` within one project detail (est/actual/remaining + status).
@@ -237,7 +320,7 @@ function assigneeProjectTasks(d, name){
   return rows;
 }
 async function getAssigneeLoad(refresh){
-  const details = await mapAll(PROJECTS, p => getDetail(p.gid, refresh));
+  const details = await mapAll(EST_PROJECTS, p => getDetail(p.gid, refresh));
   const est = {}, act = {}, counts = {}, breakdown = {};
   for (const d of details){
     d.labels.forEach((name, i) => {
@@ -255,19 +338,52 @@ async function getAssigneeLoad(refresh){
 }
 
 // ---- Logged-hours layer for a date range (mirrors logged_detail / get_logged_summaries) ----
-// Mirrors entries_for_tasks: the per-task entry reads were the bulk of every load, so
-// uncached ones go out BATCH_MAX at a time. Entries don't depend on the selected range, so a
-// range change re-filters what is already here instead of re-querying.
-const _entries = {};
-async function entriesForTasks(gids, refresh){
+// Mirrors entries_for_tasks. The per-task entry reads are the bulk of every load and Asana's
+// rate limit puts a hard floor under a few hundred of them, so they're cached in localStorage
+// and only re-read when they can have changed: a task's `actual_time_minutes` IS the sum of its
+// time entries, so an unchanged total means unchanged entries. Any task whose total moved is
+// always re-fetched, and Refresh re-reads everything. Entries also don't depend on the selected
+// range, so changing the range only re-filters what's already here.
+const ENTRY_STORE = 'asanaEntries.v1', ENTRY_STORE_MAX = 8000;
+let _entries = (() => {
+  try {
+    const blob = JSON.parse(localStorage.getItem(ENTRY_STORE) || 'null');
+    return (blob && blob.v === 1 && blob.entries) ? blob.entries : {};
+  } catch (e) { return {}; }
+})();
+let _entriesDirty = false;
+function saveEntryCache(){
+  if (!_entriesDirty) return;
+  _entriesDirty = false;
+  try {
+    let entries = _entries;
+    const keys = Object.keys(entries);
+    if (keys.length > ENTRY_STORE_MAX){
+      entries = {};
+      for (const k of keys.slice(-ENTRY_STORE_MAX)) entries[k] = _entries[k];
+    }
+    localStorage.setItem(ENTRY_STORE, JSON.stringify({ v: 1, entries }));
+  } catch (e) {
+    // Out of quota (or storage disabled): drop the cache rather than half-write it.
+    try { localStorage.removeItem(ENTRY_STORE); } catch (e2) {}
+  }
+}
+// minutesByGid: { task gid: tracked minutes }
+async function entriesForTasks(minutesByGid, refresh){
   const out = {}, missing = [];
-  for (const g of gids){
-    if (!refresh && _entries[g]) out[g] = _entries[g];
+  for (const [g, minutes] of Object.entries(minutesByGid)){
+    const e = _entries[g];
+    if (!refresh && e && e.minutes === minutes) out[g] = e.rows;
     else missing.push(g);
   }
   if (missing.length){
     const byPath = await asanaBatch(missing.map(entriesPath));
-    for (const g of missing) out[g] = _entries[g] = byPath[entriesPath(g)];
+    for (const g of missing){
+      const rows = byPath[entriesPath(g)];
+      _entries[g] = { rows, minutes: minutesByGid[g] };
+      out[g] = rows;
+    }
+    _entriesDirty = true;
   }
   return out;
 }
@@ -282,14 +398,18 @@ async function loggedDetail(gid, start, end, refresh){
     if (it.completed && it.completed_at){ const day = it.completed_at.slice(0, 10);
       if (start <= day && day <= end) completedDates[it.gid] = day; }
   };
+  // { gid: [name, tracked minutes] } — the minutes are what the entry cache validates against.
   const cand = {};
-  for (const t of tasks){ noteCompleted(t); if ((t.actual_time_minutes || 0) > 0) cand[t.gid] = t.name || '(untitled)'; }
-  for (const subs of Object.values(tree.subs))
-    for (const s of subs){ noteCompleted(s); if ((s.actual_time_minutes || 0) > 0) cand[s.gid] = s.name || '(untitled)'; }
-  // One batched read for every candidate task, then filter to the range in memory.
-  const byGid = await entriesForTasks(Object.keys(cand), refresh);
+  for (const it of [...tasks, ...Object.values(tree.subs).flat()]){
+    noteCompleted(it);
+    const minutes = it.actual_time_minutes || 0;
+    if (minutes > 0) cand[it.gid] = [it.name || '(untitled)', minutes];
+  }
+  // Only tasks whose tracked total moved are read from Asana; the rest come from cache.
+  const byGid = await entriesForTasks(Object.fromEntries(
+    Object.entries(cand).map(([g, [, m]]) => [g, m])), refresh);
   const seen = new Set(), entries = [];
-  for (const [g, name] of Object.entries(cand))
+  for (const [g, [name]] of Object.entries(cand))
     for (const e of byGid[g] || []){
       const entered = e.entered_on || '';
       if (!entered || entered < start || entered > end) continue;
@@ -326,6 +446,7 @@ async function getLoggedSummaries(refresh, start, end){
   const key = start + ':' + end;
   if (!refresh && CACHE.logged_summaries[key]) return CACHE.logged_summaries[key];
   const details = await mapAll(PROJECTS, p => getLoggedDetail(p.gid, refresh, start, end));
+  saveEntryCache();      // end of a full load: persist whatever it just read
   return (CACHE.logged_summaries[key] = details.map(loggedSummaryFromDetail));
 }
 
@@ -440,6 +561,7 @@ def build():
                .replace('__CAP__', str(ASSIGNEE_CAP))
                .replace('__TEAM__', TEAM)
                .replace('__PROJECTS__', PROJECTS)
+               .replace('__ESTPROJECTS__', EST_PROJECTS)
                .replace('__GROUPS__', GROUPS)
                .replace('__DEFSTART__', DEF_START)
                .replace('__DEFEND__', DEF_END))

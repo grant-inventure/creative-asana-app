@@ -35,13 +35,13 @@ PROJECTS = [
     {"gid": "1216989200658405", "name": "My Pest Solutions SEO", "cap": 4},
     {"gid": "1214228966572508", "name": "Firebird MSA"},
     {"gid": "1214228966572503", "name": "Myrick Marine"},
-    {"gid": "1214229029715234", "name": "Savannah Bee: Zendesk"},
+    {"gid": "1214229029715234", "name": "Savannah Bee"},
     {"gid": "1214228966572536", "name": "CMD: Concierge Clinics"},
     {"gid": "1214228966572531", "name": "CMD: Pathologic"},
     {"gid": "1214228966572526", "name": "CMD: Products"},
     {"gid": "1214228966572521", "name": "Georgia Skin & Cancer Clinic"},
     {"gid": "1214228966572541", "name": "DocSmith.md MSA", "cap": 24},
-    {"gid": "1214228966572551", "name": "Savannah Camellia Fest 2026"},
+    {"gid": "1214228966572551", "name": "Savannah Camellia Fest 2027"},
     {"gid": "1214755322546416", "name": "Project Twilight"},
     {"gid": "1214228966572578", "name": "Claude: Discovery and Engineering"},
     {"gid": "1214228966572573", "name": "Autotask Reporting"},
@@ -63,8 +63,22 @@ GROUPS = [
         "1214228966572531",   # CMD: Pathologic
         "1214228966572526",   # CMD: Products
         "1216154609521581",   # NuNu
+        "1214228966572521",   # Georgia Skin & Cancer Clinic
     ]},
 ]
+
+# Projects with no planned work left on the board: dropped from every Estimated Hours view
+# (Team Capacity · Estimated, Bar Chart, Project Cards) while their logged history stays in
+# the Actual Hours views. Referenced by gid, so a rename can't silently un-exclude one.
+EXCLUDE_ESTIMATED = {
+    "1214228966572508",   # Firebird MSA
+    "1214228966572503",   # Myrick Marine
+    "1214228966572568",   # Brain Dump
+    "1214755322546416",   # Project Twilight
+    "1214228966572573",   # Autotask Reporting
+}
+# The project list every Estimated Hours view aggregates over. Actual Hours keeps all PROJECTS.
+EST_PROJECTS = [p for p in PROJECTS if p["gid"] not in EXCLUDE_ESTIMATED]
 
 EST_FIELD = "Estimated time"             # stored in minutes
 EXCLUDE_SECTIONS = {"completed"}         # status columns excluded from hour totals (case-insensitive)
@@ -106,11 +120,12 @@ def get_token():
 TOKEN = get_token()
 
 # Two long-lived, bounded thread pools shared across all requests.
-#  - LEAF_POOL runs the many small API calls (subtasks, time entries). Capping it
-#    keeps total concurrent connections to Asana within its limits.
+#  - LEAF_POOL runs the many small API calls (subtasks, time entries). The binding limit is
+#    Asana's per-token rate limit, not connections, and a load is hundreds of small reads, so
+#    it is sized wide; api_get halves it on the first 429 rather than crawling by default.
 #  - PROJECT_POOL drives whole projects concurrently; its workers only ever block
 #    waiting on LEAF_POOL futures, so the two pools can't deadlock each other.
-LEAF_POOL = ThreadPoolExecutor(max_workers=16)
+LEAF_POOL = ThreadPoolExecutor(max_workers=24)
 PROJECT_POOL = ThreadPoolExecutor(max_workers=8)
 
 # ---- HTTP layer: every Asana call goes through here ----
@@ -121,6 +136,37 @@ PROJECT_POOL = ThreadPoolExecutor(max_workers=8)
 # effect a connection pool sized to them. gzip cuts the task-list payloads several-fold.
 _LOCAL = threading.local()
 _ASANA_HOST = urllib.parse.urlsplit(API).netloc
+
+
+# The real ceiling is Asana's per-token rate limit (1500 requests/minute on paid plans, 150 on
+# free), not connection count — so pace every call through a token bucket just under it rather
+# than letting 24 threads sprint into a 429 storm. A 429 halves the rate, so a free-tier token
+# settles down instead of thrashing.
+_RATE = [20.0]                    # requests/second = 1200/min
+_BUCKET = [20.0, time.time()]     # [tokens, last refill]
+_BUCKET_LOCK = threading.Lock()
+
+
+def _take_token():
+    while True:
+        with _BUCKET_LOCK:
+            now = time.time()
+            rate = _RATE[0]
+            _BUCKET[0] = min(rate, _BUCKET[0] + (now - _BUCKET[1]) * rate)
+            _BUCKET[1] = now
+            if _BUCKET[0] >= 1:
+                _BUCKET[0] -= 1
+                return
+            wait = (1 - _BUCKET[0]) / rate
+        time.sleep(wait)
+
+
+def _rate_back_off():
+    with _BUCKET_LOCK:
+        if _RATE[0] > 2:
+            _RATE[0] = max(2.0, _RATE[0] / 2)
+            print(f"WARNING: Asana rate-limited this token (429) — pacing reduced to "
+                  f"{_RATE[0]:.0f} requests/sec.")
 
 
 def _drop_conn():
@@ -181,6 +227,7 @@ def _api_call(method, path_or_url, payload, tries=4):
     _count(target)
     for attempt in range(tries):
         last = attempt == tries - 1
+        _take_token()
         try:
             conn = getattr(_LOCAL, "conn", None)
             if conn is None:
@@ -195,6 +242,8 @@ def _api_call(method, path_or_url, payload, tries=4):
             time.sleep(0.3 * (attempt + 1))
             continue
         if resp.status == 429 or resp.status >= 500:
+            if resp.status == 429:
+                _rate_back_off()
             if (resp.getheader("Connection") or "").lower() == "close":
                 _drop_conn()
             if last:
@@ -223,33 +272,86 @@ def api_pages(path):
 # hundreds of tiny per-task reads (time entries, subtasks), so batching them cuts the round
 # trips — the thing that actually costs seconds — by ~10x.
 BATCH_MAX = 10
-_BATCH_WARNED = []
+# Asana accepts two shapes for a batch action: the query string inline in relative_path, or the
+# path bare with `options` alongside. Workspaces differ in what they accept, so try the inline
+# form, fall back to the structured form, and only then give up on batching for this process —
+# escalating once, not once per chunk, so a rejection can't cost hundreds of wasted POSTs.
+BATCH_MODES = ["path", "options", "off"]
+_BATCH_MODE = [0]
 
 
-def _warn_batch(why):
+def _batch_action(path, mode):
+    if mode == "path":
+        return {"method": "get", "relative_path": path}
+    base, _, qs = path.partition("?")
+    q = urllib.parse.parse_qs(qs)
+    options = {}
+    if q.get("opt_fields"):
+        options["fields"] = q["opt_fields"][0].split(",")
+    if q.get("limit"):
+        options["limit"] = int(q["limit"][0])
+    return {"method": "get", "relative_path": base, "options": options}
+
+
+def _batch_off(why):
     """Say once, loudly, that batching isn't working. The load still completes — every read
     falls back to its own request — but at ~10x the requests, i.e. a slow start."""
-    if _BATCH_WARNED:
+    if _BATCH_MODE[0] == len(BATCH_MODES) - 1:
         return
-    _BATCH_WARNED.append(True)
+    _BATCH_MODE[0] = len(BATCH_MODES) - 1
     print(f"WARNING: Asana /batch_requests unavailable ({why}) — falling back to one request "
           f"per read, so this load will be slow. Data is unaffected.")
+
+
+def _batch_try(paths, mode):
+    """(results, problem) for one batch attempt. results is None when this shape didn't work."""
+    actions = [_batch_action(p, mode) for p in paths]
+    try:
+        results = api_post("/batch_requests", {"data": {"actions": actions}}).get("data")
+    except urllib.error.HTTPError as e:
+        # Some accounts have no /batch_requests endpoint at all (404) or can't reach it (403).
+        # No action shape can fix that, so stop trying immediately.
+        if e.code in (403, 404):
+            _batch_off(f"Asana {e.code} on /batch_requests")
+        return None, f"Asana {e.code}"
+    except (http.client.HTTPException, OSError, json.JSONDecodeError) as e:
+        return None, e
+    if not isinstance(results, list) or len(results) != len(paths):
+        return None, "unexpected /batch_requests response"
+    # Every action failing points at the request shape — but only if there were several. A
+    # small batch can fail outright for ordinary reasons (a deleted task), and that must not
+    # be read as "batching is broken"; those paths just fall back individually below.
+    if len(paths) >= 3 and all(not r or r.get("status_code") != 200 for r in results):
+        first = results[0] or {}
+        errs = (first.get("body") or {}).get("errors") or [{}]
+        return None, errs[0].get("message") or f"status {first.get('status_code')}"
+    return results, None
 
 
 def _batch_chunk(paths):
     """One /batch_requests call covering up to BATCH_MAX paths -> {path: data list}.
 
-    Any batch Asana rejects, or answers in a shape we don't recognise, falls back to plain
-    per-path GETs. Batching is an optimization only: it can cost requests, never data.
+    Any batch Asana rejects, any action that failed, and any first page that says there is more
+    falls back to a plain GET. Batching is an optimization only: it can cost requests, never data.
     """
-    actions = [{"method": "get", "relative_path": p} for p in paths]
-    try:
-        results = api_post("/batch_requests", {"data": {"actions": actions}}).get("data")
-        if not isinstance(results, list) or len(results) != len(paths):
-            raise ValueError("unexpected /batch_requests response")
-    except (urllib.error.HTTPError, http.client.HTTPException, OSError, ValueError,
-            json.JSONDecodeError) as e:
-        _warn_batch(e)
+    results = None
+    while True:
+        mode_i = _BATCH_MODE[0]
+        mode = BATCH_MODES[mode_i]
+        if mode == "off":
+            break
+        results, problem = _batch_try(paths, mode)
+        if results is not None:
+            break
+        if _BATCH_MODE[0] != mode_i:
+            break               # _batch_try already gave up for good (e.g. a 404 endpoint)
+        # Every action failed: this shape isn't supported here. Try the next one, then stop.
+        if BATCH_MODES[mode_i + 1] == "off":
+            _batch_off(problem)
+            break
+        print(f'Asana batch shape "{mode}" rejected ({problem}) — trying the next shape.')
+        _BATCH_MODE[0] = mode_i + 1
+    if results is None:
         return {p: api_pages(p) for p in paths}
     out = {}
     for path, res in zip(paths, results):
@@ -263,6 +365,10 @@ def _batch_chunk(paths):
     return out
 
 
+_BATCH_PROBED = [False]
+_BATCH_PROBE_LOCK = threading.Lock()
+
+
 def api_batch(paths):
     """GET many small collections, BATCH_MAX per HTTP request. Returns {path: data list}."""
     paths = list(paths)
@@ -270,6 +376,15 @@ def api_batch(paths):
         return {}
     chunks = [paths[i:i + BATCH_MAX] for i in range(0, len(paths), BATCH_MAX)]
     out = {}
+    # Send the very first chunk on its own and wait for it. If this account has no
+    # /batch_requests endpoint, that costs exactly one wasted request to find out, instead of a
+    # whole parallel wave of them discovering it at the same time.
+    if not _BATCH_PROBED[0]:
+        with _BATCH_PROBE_LOCK:
+            if not _BATCH_PROBED[0]:
+                out.update(_batch_chunk(chunks[0]))
+                _BATCH_PROBED[0] = True
+                chunks = chunks[1:]
     for part in LEAF_POOL.map(_batch_chunk, chunks):
         out.update(part)
     return out
@@ -500,7 +615,7 @@ def get_summaries(refresh=False):
         if cached is not None:
             return cached
     # Build every project's detail concurrently instead of one-at-a-time.
-    details = PROJECT_POOL.map(lambda p: get_detail(p["gid"], refresh=refresh), PROJECTS)
+    details = PROJECT_POOL.map(lambda p: get_detail(p["gid"], refresh=refresh), EST_PROJECTS)
     out = [summary_from_detail(d) for d in details]
     with CACHE_LOCK:
         CACHE["summaries"] = out
@@ -537,7 +652,7 @@ def get_assignee_load(refresh=False):
     `hours` is the work each person still has left to do. Reuses the cached per-project
     detail, so it adds no Asana calls when the projects are already loaded.
     """
-    details = list(PROJECT_POOL.map(lambda p: get_detail(p["gid"], refresh=refresh), PROJECTS))
+    details = list(PROJECT_POOL.map(lambda p: get_detail(p["gid"], refresh=refresh), EST_PROJECTS))
     est, act, counts, breakdown = {}, {}, {}, {}
     for d in details:
         for name, e, a, cnt in zip(d["labels"], d["hours"], d["actual_hours"], d["counts"]):
@@ -569,19 +684,81 @@ def get_assignee_load(refresh=False):
 
 # ---- "Hours logged": actual time-tracking entries dated in a given month (YYYY-MM) ----
 
-def entries_for_tasks(task_gids, refresh=False):
-    """Time entries for many tasks -> {task gid: rows}.
+# The entry cache is the one thing worth keeping across restarts: it is the bulk of a load, and
+# it self-invalidates on the tracked-minutes total (see entries_for_tasks). Kept next to the
+# script, gitignored, and holding nothing secret — task gids, durations, dates, author names.
+ENTRY_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".entries_cache.json")
+ENTRY_CACHE_VERSION = 1
+ENTRY_CACHE_MAX = 8000           # tasks; oldest fetches are dropped past this
+_ENTRY_CACHE_DIRTY = [False]
+_ENTRY_CACHE_IO = threading.Lock()
 
-    This is the call that used to dominate a load — one request per task with tracked time —
-    so anything not already cached is fetched BATCH_MAX at a time. Entries don't depend on the
-    selected date range, so a range change re-filters these instead of re-querying Asana.
+
+def load_entry_cache():
+    """Warm CACHE["entries"] from disk. Any problem is ignored — it's only a cache."""
+    try:
+        with open(ENTRY_CACHE_PATH, "r", encoding="utf-8") as f:
+            blob = json.load(f)
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(blob, dict) or blob.get("v") != ENTRY_CACHE_VERSION:
+        return 0
+    entries = blob.get("entries")
+    if not isinstance(entries, dict):
+        return 0
+    with CACHE_LOCK:
+        # `at` is deliberately not restored: a fresh process must not think it just fetched
+        # these, or the REFRESH_SHARE_WINDOW would suppress a genuine Refresh.
+        for gid, e in entries.items():
+            if isinstance(e, dict) and isinstance(e.get("rows"), list):
+                CACHE["entries"][gid] = {"rows": e["rows"], "minutes": e.get("minutes"), "at": 0}
+        return len(CACHE["entries"])
+
+
+def save_entry_cache():
+    """Write the entry cache out if it changed. Best-effort: a failure just costs speed."""
+    if not _ENTRY_CACHE_DIRTY[0]:
+        return
+    with _ENTRY_CACHE_IO:
+        _ENTRY_CACHE_DIRTY[0] = False
+        with CACHE_LOCK:
+            items = sorted(CACHE["entries"].items(), key=lambda kv: -(kv[1].get("at") or 0))
+            keep = {g: {"rows": e["rows"], "minutes": e.get("minutes")}
+                    for g, e in items[:ENTRY_CACHE_MAX]}
+        tmp = ENTRY_CACHE_PATH + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"v": ENTRY_CACHE_VERSION, "entries": keep}, f)
+            os.replace(tmp, ENTRY_CACHE_PATH)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def entries_for_tasks(minutes_by_gid, refresh=False):
+    """Time entries for many tasks -> {task gid: rows}. Input is {task gid: tracked minutes}.
+
+    This is the call that dominates a load — one request per task that has tracked time, and
+    Asana's rate limit puts a hard floor under a few hundred of those. So entries are cached and
+    only re-read when they can have changed:
+
+    a task's `actual_time_minutes` IS the sum of its time entries, so an unchanged total means
+    unchanged entries. That invariant is what makes the cache safe to keep across a restart —
+    any task whose total moved is always re-fetched, and Refresh re-reads everything regardless.
+    Entries also don't depend on the selected date range, so changing the range only re-filters.
     """
     out, missing, now = {}, [], time.time()
     with CACHE_LOCK:
-        for g in task_gids:
+        for g, minutes in minutes_by_gid.items():
             e = CACHE["entries"].get(g)
-            if e and (not refresh or now - e["at"] < REFRESH_SHARE_WINDOW):
-                out[g] = e["rows"]
+            if not e:
+                missing.append(g)
+            elif now - e.get("at", 0) < REFRESH_SHARE_WINDOW:
+                out[g] = e["rows"]      # just fetched; don't re-read for a concurrent request
+            elif not refresh and e.get("minutes") == minutes:
+                out[g] = e["rows"]      # total unchanged -> entries unchanged
             else:
                 missing.append(g)
     if missing:
@@ -590,8 +767,9 @@ def entries_for_tasks(task_gids, refresh=False):
         with CACHE_LOCK:
             for g in missing:
                 rows = by_path[entries_path(g)]
-                CACHE["entries"][g] = {"rows": rows, "at": fetched}
+                CACHE["entries"][g] = {"rows": rows, "minutes": minutes_by_gid[g], "at": fetched}
                 out[g] = rows
+        _ENTRY_CACHE_DIRTY[0] = True
     return out
 
 
@@ -616,22 +794,19 @@ def logged_detail(gid, start=DEFAULT_START, end=DEFAULT_END, refresh=False):
     # Only query time entries for items that actually have logged time.
     # Dedupe by task gid: a subtask added directly to the project would otherwise be
     # reached twice (project task list + parent's subtasks) and double-counted.
+    # {gid: (name, tracked minutes)} — the minutes are what the entry cache validates against.
     cand_by_gid = {}
-    for t in tasks:
-        note_completed(t)
-        if (t.get("actual_time_minutes") or 0) > 0:
-            cand_by_gid[t["gid"]] = t.get("name", "(untitled)")
-    for subs in tree["subs"].values():
-        for s in subs:
-            note_completed(s)
-            if (s.get("actual_time_minutes") or 0) > 0:
-                cand_by_gid[s["gid"]] = s.get("name", "(untitled)")
-    # One batched read for every candidate task, then filter to the range in memory.
-    by_gid = entries_for_tasks(cand_by_gid.keys(), refresh=refresh)
+    for item in list(tasks) + [s for subs in tree["subs"].values() for s in subs]:
+        note_completed(item)
+        minutes = item.get("actual_time_minutes") or 0
+        if minutes > 0:
+            cand_by_gid[item["gid"]] = (item.get("name", "(untitled)"), minutes)
+    # Only tasks whose tracked total moved are read from Asana; the rest come from cache.
+    by_gid = entries_for_tasks({g: m for g, (_, m) in cand_by_gid.items()}, refresh=refresh)
 
     # Collect entries, deduping by entry gid as a final guard against any double-pull.
     seen, entries = set(), []
-    for tgid, name in cand_by_gid.items():
+    for tgid, (name, _minutes) in cand_by_gid.items():
         for e in by_gid.get(tgid, []):
             entered = e.get("entered_on") or ""
             if not entered or not (start <= entered <= end):
@@ -723,6 +898,7 @@ def get_logged_summaries(refresh=False, start=DEFAULT_START, end=DEFAULT_END):
     out = [logged_summary_from_detail(d) for d in details]
     with CACHE_LOCK:
         CACHE["logged_summaries"][key] = out
+    save_entry_cache()      # end of a full load: persist whatever it just read
     return out
 
 
@@ -737,7 +913,10 @@ PAGE = r"""<!DOCTYPE html>
 <style>
   :root { --blue:#6aa9e0; --blue-d:#9cc7f0; --green:#4cc085; --green-d:#6cd49d; --red:#e26b66;
           --bg:#12151a; --panel:#2a2f38; --panel2:#353b45; --border:#3c4350;
-          --text:#edeff2; --muted:#a3aab4; --faint:#737b86; }
+          --text:#edeff2; --muted:#a3aab4; --faint:#737b86;
+          /* capacity gold — the same reserved hue as C.amber; only ever used for
+             "this budget is spent" signals, never as a data color. */
+          --amber:#f0c674; --amber-line:#7d6a3c; --amber-tint:#2c281d; }
   body { font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin:0; background:var(--bg); color:var(--text); }
   .wrap { max-width:1040px; margin:32px auto; padding:0 20px; }
   h1 { font-size:22px; margin:0 0 2px; }
@@ -761,10 +940,16 @@ PAGE = r"""<!DOCTYPE html>
      selectors too, so it wins over the blue/green accent those numbers normally take. */
   .neg, .card .stat .n.neg, .card.logged .stat .n.neg { color:var(--red); }
   .dash-updated { font-size:11px; color:var(--faint); white-space:nowrap; }
+  /* Budget bar: 20 discrete blocks of 5% rather than one continuous fill, so a glance
+     reads as a count ("14 of 20 blocks") instead of an eyeballed length. Green = room
+     left, gold = exactly at capacity, red = over. */
   .cap-bar { margin-top:14px; }
-  .cap-bar .track { height:8px; background:var(--panel2); border-radius:5px; overflow:hidden; }
-  .cap-bar .fill { height:100%; background:var(--green); border-radius:5px; }
-  .cap-bar.over .fill { background:var(--red); }
+  .cap-wide { margin:0 0 18px; }   /* the bucket page's budget bar, under the stat strip */
+  .cap-bar .track { display:flex; gap:2px; }
+  .cap-bar .blk { flex:1 1 0; height:9px; border-radius:2px; background:var(--panel2); }
+  .cap-bar .blk.on { background:var(--green); }
+  .cap-bar.at .blk.on { background:var(--amber); }
+  .cap-bar.over .blk.on { background:var(--red); }
   .cap-bar .lab { font-size:11px; color:var(--muted); margin-top:5px; }
   /* Filter toolbar. Every tab that filters anything uses exactly one of these, directly
      under the stat strip, and it always opens with a bold .tb-label. It sits in its own
@@ -841,6 +1026,11 @@ PAGE = r"""<!DOCTYPE html>
   .card.logged .cap-bar { margin-top:22px; }   /* extra space between the big numbers and the bar */
   /* MSA/capacity cards: lighter panel + brighter border so they stand out at the top of the list */
   .card.cap { background:var(--panel2); border-color:#5c6b86; }
+  /* A project (or bucket) that has spent its whole monthly budget: gold tint, so "no hours
+     left" is visible from the grid without reading a single number. */
+  .card.at-cap, .card.cap.at-cap { background:var(--amber-tint); border-color:var(--amber-line); }
+  .card.at-cap:hover { border-color:var(--amber); }
+  .card.at-cap .grp-row:hover { background:#3a3427; }
   .grp-card { grid-column: 1 / -1; }   /* combined buckets (e.g. CMD) span the whole row */
   /* combined budget-group card: per-project breakdown rows */
   .grp-tag { font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.05em;
@@ -880,10 +1070,30 @@ PAGE = r"""<!DOCTYPE html>
   .donut-legend { display:flex; flex-wrap:wrap; gap:8px 18px; margin:0 0 18px; }
   .dl-item { display:inline-flex; align-items:center; gap:7px; font-size:12px; color:var(--muted); }
   .dl-item i { width:11px; height:11px; border-radius:3px; flex:0 0 auto; }
+  /* The legend swatch for a real project is a color input: click it for the browser's color
+     wheel and that project is recolored everywhere (saved per-browser). The two synthetic
+     grey slices stay plain <i> markers. */
+  .dl-item input.dl-swatch { -webkit-appearance:none; appearance:none; width:13px; height:13px;
+             padding:0; border:0; border-radius:3px; flex:0 0 auto; cursor:pointer;
+             background:none; outline:1px solid transparent; }
+  .dl-item input.dl-swatch:hover { outline:1px solid var(--text); outline-offset:2px; }
+  .dl-item input.dl-swatch::-webkit-color-swatch-wrapper { padding:0; }
+  .dl-item input.dl-swatch::-webkit-color-swatch { border:0; border-radius:3px; }
+  .dl-item input.dl-swatch::-moz-color-swatch { border:0; border-radius:3px; }
+  /* Chart.js paints its tooltip inside the canvas, so on the 170 px donut cards it was clipped
+     at the card edge. Those charts use this DOM tooltip instead: fixed-position, above every
+     card and the sticky sidebar, and clamped into the viewport. */
+  .chart-tip { position:fixed; z-index:200; pointer-events:none; opacity:0; transition:opacity .08s;
+               background:var(--panel2); border:1px solid var(--border); border-radius:8px;
+               padding:8px 10px; font-size:12px; color:var(--text); max-width:270px;
+               box-shadow:0 8px 22px rgba(0,0,0,.6); }
+  .chart-tip .tip-h { display:flex; align-items:center; gap:7px; font-weight:600; margin-bottom:3px; }
+  .chart-tip .tip-h i { width:10px; height:10px; border-radius:3px; flex:0 0 auto; }
+  .chart-tip .tip-l { color:var(--muted); font-variant-numeric:tabular-nums; }
   .donut-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:16px; }
   .donut-card { background:var(--panel2); border:1px solid var(--border); border-radius:12px;
                 padding:14px 12px 12px; cursor:pointer; transition:border-color .08s, transform .08s; }
-  .donut-card:hover { border-color:var(--blue); transform:translateY(-2px); }
+  .donut-card:hover { border-color:var(--blue); transform:translateY(-2px); position:relative; z-index:2; }
   .donut-card h4 { font-size:13px; margin:0 0 8px; text-align:center; overflow:hidden;
                    text-overflow:ellipsis; white-space:nowrap; }
   .donut-box { position:relative; height:170px; }
@@ -946,6 +1156,40 @@ function destroyCharts(){
   if (chart) { chart.destroy(); chart = null; }
   donutCharts.forEach(c => c.destroy());
   donutCharts = [];
+  hideChartTip();   // a chart can be torn down mid-hover, leaving its tooltip stranded
+}
+
+// One shared DOM tooltip for charts whose canvas is too small to hold Chart.js's own
+// (the per-person donuts). Enable per-chart with:
+//   tooltip: { enabled:false, external:externalTip, callbacks:{...} }
+let _chartTip = null;
+function chartTipEl(){
+  if (!_chartTip) {
+    _chartTip = document.createElement('div');
+    _chartTip.className = 'chart-tip';
+    document.body.appendChild(_chartTip);
+  }
+  return _chartTip;
+}
+function hideChartTip(){ if (_chartTip) _chartTip.style.opacity = 0; }
+function externalTip(ctx){
+  const tt = ctx.tooltip;
+  if (!tt || !tt.opacity) { hideChartTip(); return; }
+  const el = chartTipEl();
+  const swatch = (tt.labelColors && tt.labelColors[0] && tt.labelColors[0].backgroundColor) || C.muted;
+  const lines = [];
+  (tt.body || []).forEach(b => lines.push(...(b.before || []), ...(b.lines || []), ...(b.after || [])));
+  el.innerHTML =
+    `<div class="tip-h"><i style="background:${swatch}"></i>${esc((tt.title || [])[0] || '')}</div>` +
+    lines.filter(l => l !== '').map(l => `<div class="tip-l">${esc(l)}</div>`).join('');
+  el.style.opacity = 1;
+  // Sit to the right of the caret, flipping to the left and clamping vertically so a ring at
+  // the edge of the grid can't push the tooltip off-screen.
+  const r = ctx.chart.canvas.getBoundingClientRect(), w = el.offsetWidth, h = el.offsetHeight;
+  let x = r.left + tt.caretX + 14;
+  if (x + w > window.innerWidth - 8) x = r.left + tt.caretX - w - 14;
+  el.style.left = Math.max(8, x) + 'px';
+  el.style.top = Math.min(Math.max(8, r.top + tt.caretY - h / 2), window.innerHeight - h - 8) + 'px';
 }
 
 // The :root palette, mirrored for canvas drawing (Chart.js can't read CSS variables).
@@ -1140,16 +1384,29 @@ const PROJECT_PALETTE = [
 const PROJECT_COLORS = {
   'Georgia Grown Market MSA': '#2ca02c',   // green
 };
+// User-picked project colors, set by clicking a swatch in a donut legend and persisted
+// per-browser, exactly like the per-person colors. A choice here wins over the pinned
+// PROJECT_COLORS and over auto-assignment, so the project reads that color everywhere.
+const PROJECT_COLOR_STORE = 'projectColors.v1';
+function loadProjectColorConfig(){
+  try { return JSON.parse(localStorage.getItem(PROJECT_COLOR_STORE)) || {}; } catch (e) { return {}; }
+}
+function saveProjectColorConfig(){
+  try { localStorage.setItem(PROJECT_COLOR_STORE, JSON.stringify(projectColorConfig)); } catch (e) {}
+}
+let projectColorConfig = loadProjectColorConfig();
 // Stable per-project colors for the Team Capacity donuts, so one project reads as the same
 // color in every person's ring.
 const _projColors = {};
 let _projColorN = 0;
 function projectColor(name){
+  if (name in projectColorConfig) return projectColorConfig[name];   // user choice wins
   if (name in PROJECT_COLORS) return PROJECT_COLORS[name];
   if (name in _projColors) return _projColors[name];
-  // Skip palette entries already spoken for (a fixed color or an earlier project), so two
-  // projects never share a hue while any unused one is left.
-  const used = new Set([...Object.values(_projColors), ...Object.values(PROJECT_COLORS)]);
+  // Skip palette entries already spoken for (a fixed color, a user choice, or an earlier
+  // project), so two projects never share a hue while any unused one is left.
+  const used = new Set([...Object.values(_projColors), ...Object.values(PROJECT_COLORS),
+                        ...Object.values(projectColorConfig)]);
   while (used.size < PROJECT_PALETTE.length && used.has(PROJECT_PALETTE[_projColorN % PROJECT_PALETTE.length])) _projColorN++;
   return (_projColors[name] = PROJECT_PALETTE[_projColorN++ % PROJECT_PALETTE.length]);
 }
@@ -1183,6 +1440,15 @@ function donutSlices(map){
   return top;
 }
 
+// Repaint every live donut from the current project colors, so a color picked in the legend
+// takes effect immediately without rebuilding the tab.
+function recolorDonuts(){
+  donutCharts.forEach(c => {
+    c.data.datasets[0].backgroundColor = c.data.labels.map(sliceColor);
+    c.update('none');
+  });
+}
+
 // A grid of one donut per person, showing how that person's hours split across projects.
 // rows: [{ name, total, slices:[{label, hours}], caption? }] — total is what the ring adds up
 // to (the capacity target when a FREE_SLICE is present), caption overrides the line beneath.
@@ -1196,9 +1462,17 @@ function donutGrid(container, rows, opts){
   // "Other"/"Unallocated" slices pinned to the end.
   const totals = {};
   rows.forEach(r => r.slices.forEach(s => { totals[s.label] = (totals[s.label] || 0) + s.hours; }));
-  const legend = Object.keys(totals)
-    .sort((a, b) => sliceRank(a) - sliceRank(b) || totals[b] - totals[a])
-    .map(p => `<span class="dl-item"><i style="background:${sliceColor(p)}"></i>${esc(p)}</span>`)
+  // A real project's swatch is a color input (click = color wheel, saved to localStorage);
+  // the synthetic "Other"/"Unallocated" slices keep their fixed grey marker.
+  const legendKeys = Object.keys(totals)
+    .sort((a, b) => sliceRank(a) - sliceRank(b) || totals[b] - totals[a]);
+  // The swatch carries an index, not the project name, so names with markup-significant
+  // characters can't break the attribute or the lookup.
+  const legend = legendKeys
+    .map((p, i) => `<span class="dl-item">${sliceRank(p)
+        ? `<i style="background:${sliceColor(p)}"></i>`
+        : `<input type="color" class="dl-swatch" value="${sliceColor(p)}" data-pi="${i}"
+                  title="Change the color of ${esc(p)}">`}${esc(p)}</span>`)
     .join('');
   container.insertAdjacentHTML('beforeend',
     `<h2 class="section-h">${esc(o.title || 'By project, per person')}</h2>
@@ -1210,6 +1484,15 @@ function donutGrid(container, rows, opts){
           <div class="donut-box"><canvas id="donut-${i}"></canvas></div>
           <div class="donut-total">${esc(r.caption || `${h2(r.total)} h · ${plural(r.slices.length, 'project')}`)}</div>
         </div>`).join('')}</div>`);
+  // Picking a color repaints every ring in place (and the swatch itself) — no reload, and the
+  // choice sticks for the next session.
+  container.querySelectorAll('input.dl-swatch').forEach(inp => {
+    inp.oninput = () => {
+      projectColorConfig[legendKeys[+inp.dataset.pi]] = inp.value;
+      saveProjectColorConfig();
+      recolorDonuts();
+    };
+  });
   rows.forEach((r, i) => {
     const el = document.getElementById('donut-' + i);
     if (!el) return;
@@ -1221,8 +1504,10 @@ function donutGrid(container, rows, opts){
                            borderColor: DONUT_BORDER, borderWidth: 2 }] },
       options: { responsive: true, maintainAspectRatio: false, cutout: '58%',
         plugins: { legend: { display: false },
-          tooltip: { callbacks: { label: ctx =>
-            `${ctx.label}: ${h2(ctx.parsed)} h (${(ctx.parsed / (r.total || 1) * 100).toFixed(0)}%)` } } } }
+          // DOM tooltip: the canvas is far too small to hold Chart.js's own without clipping it.
+          tooltip: { enabled: false, external: externalTip, callbacks: {
+            title: items => items.length ? items[0].label : '',
+            label: ctx => `${h2(ctx.parsed)} h · ${(ctx.parsed / (r.total || 1) * 100).toFixed(0)}% of ${h2(r.total)} h` } } } }
     }));
   });
   // Clicking anywhere on a card opens that person's existing drill-in.
@@ -1230,13 +1515,23 @@ function donutGrid(container, rows, opts){
     c.onclick = () => o.onPick(rows[+c.dataset.di]));
 }
 
+// The budget bar is drawn as CAP_BLOCKS discrete blocks (5% each): a block lights up for
+// every whole 5% of the monthly capacity spent, so the bar can be read as a count.
+const CAP_BLOCKS = 20, CAP_BLOCK_PCT = 100 / CAP_BLOCKS;
+// True once a project/bucket has spent its whole monthly budget — the gold-tint trigger.
+const atCapacity = (hours, cap) => cap > 0 && Number(hours || 0) >= cap;
 function capBar(hours, cap){
   if (cap == null) return '';   // only projects with a monthly capacity get a bar
   const pct = cap > 0 ? (hours / cap) * 100 : 0;
   const over = pct > 100;
-  return `<div class="cap-bar${over ? ' over' : ''}">
-      <div class="track"><div class="fill" style="width:${Math.min(pct,100)}%"></div></div>
-      <div class="lab">${h2(hours)} / ${h2(cap)} h used · ${pct.toFixed(0)}%${over ? ' — over capacity' : ''}</div>
+  const on = Math.max(0, Math.min(CAP_BLOCKS, Math.floor(pct / CAP_BLOCK_PCT)));
+  let blocks = '';
+  for (let i = 0; i < CAP_BLOCKS; i++) blocks += `<i class="blk${i < on ? ' on' : ''}"></i>`;
+  const tone = over ? ' over' : (pct >= 100 ? ' at' : '');
+  return `<div class="cap-bar${tone}">
+      <div class="track">${blocks}</div>
+      <div class="lab">${h2(hours)} / ${h2(cap)} h used · ${pct.toFixed(0)}%${
+        over ? ' — over capacity' : (pct >= 100 ? ' — at capacity' : '')}</div>
     </div>`;
 }
 function setCrumbs(items) {
@@ -1414,7 +1709,7 @@ function capCard(w) {
   const used = Number(w.hours || 0), cap = Number(w.cap || 0);
   const remaining = cap - used;
   const c = document.createElement('div');
-  c.className = 'card logged';
+  c.className = 'card logged' + (atCapacity(used, cap) ? ' at-cap' : '');
   c.innerHTML = `<h3>${esc(w.name)}</h3>
     <div class="stats">
       <div class="stat"><div class="n">${h2(w.cap)}</div><div class="l">Capacity h/mo</div></div>
@@ -1443,7 +1738,7 @@ function groupCard(g) {
   const used = Number(g.hours || 0), cap = Number(g.cap || 0);
   const remaining = cap - used;
   const c = document.createElement('div');
-  c.className = 'card logged grp-card';
+  c.className = 'card logged grp-card' + (atCapacity(used, cap) ? ' at-cap' : '');
   const rows = g.members.map(m =>
     `<div class="grp-row" data-gid="${m.gid}" title="Open ${esc(m.name)}">
        <span class="grp-name">${esc(m.name)}</span>
@@ -1456,10 +1751,13 @@ function groupCard(g) {
       <div class="stat"><div class="n${remaining < 0 ? ' neg' : ''}">${h2(remaining)}</div><div class="l">${remaining < 0 ? 'Over' : 'Remaining'}</div></div>
     </div>
     ${capBar(used, cap)}
-    <div class="grp-members">${rows}</div>`;
-  // Each member row opens that project's own Hours-Logged detail.
+    <div class="grp-members">${rows}</div>
+    <div class="go">Open bucket · hours by project →</div>`;
+  // Each member row opens that project's own Hours-Logged detail; the card itself opens the
+  // bucket's own page, where every member project sits in one chart.
   c.querySelectorAll('.grp-row[data-gid]').forEach(r =>
     r.onclick = (e) => { e.stopPropagation(); location.hash = '#/logged/' + r.dataset.gid; });
+  c.onclick = () => { location.hash = '#/grp/' + encodeURIComponent(g.name); };
   return c;
 }
 
@@ -2343,7 +2641,8 @@ async function renderDashboard() {
       const slices = donutSlices(m);
       return { name: r.name, slices, total: slices.reduce((a, s) => a + s.hours, 0) };
     }), { title: 'Logged hours by project, per person',
-          sub: 'Each ring is one person. Click a card for their per-project totals.',
+          sub: 'Each ring is one person. Click a card for their per-project totals and the tasks '
+             + 'behind them; click a legend swatch to recolor that project.',
           onPick: r => showLoggedBreakdown(r.name) });
   }
 
@@ -2353,6 +2652,15 @@ async function renderDashboard() {
     destroyCharts();
     const key = dateStart + ':' + dateEnd, pc = projPersonCache[key] || {};
     const nameOf = Object.fromEntries((loggedData || []).map(w => [w.gid, w.name]));
+    // Every task this person logged time to in the range, keyed by project — the same
+    // per-item rollup the Items tab uses, so the numbers agree.
+    const tasksByProject = {};
+    (itemStatsCache[key] || []).forEach(it => {
+      if (it.person !== person || !(it.hours > 0)) return;
+      (tasksByProject[it.project] || (tasksByProject[it.project] = [])).push(it);
+    });
+    Object.values(tasksByProject).forEach(list =>
+      list.sort((a, b) => b.hours - a.hours || a.task.localeCompare(b.task)));
     const rows_ = [];
     Object.entries(pc).forEach(([gid, pm]) => {
       const v = pm[person];
@@ -2360,21 +2668,37 @@ async function renderDashboard() {
     });
     rows_.sort((a, b) => b.hours - a.hours);
     const tot = rows_.reduce((a, r) => a + r.hours, 0);
+    const nEntries = rows_.reduce((a, r) => a + (tasksByProject[r.project] || [])
+      .reduce((x, t) => x + (t.entries || 0), 0), 0);
+    const nTasks = rows_.reduce((a, r) => a + (tasksByProject[r.project] || []).length, 0);
     const cap = (teamData && teamData.cap) || 128;
     const pct = (tot / cap * 100).toFixed(0);
     const cell = (h) => `<td class="hours">${h2(h)} h</td>`;
-    let body = rows_.map(r => `<tr><td>${esc(r.project)}</td>${cell(r.hours)}</tr>`).join('');
-    if (!rows_.length) body = '<tr><td colspan="2" class="muted">No hours logged in this range.</td></tr>';
+    // Each project is a bold header row, with the tasks that person logged to it beneath it.
+    let body = rows_.map(r => {
+      const tasks = tasksByProject[r.project] || [];
+      let out = `<tr class="parent"><td>${esc(r.project)}</td>${cell(r.hours)}` +
+        `<td class="hours">${tasks.reduce((a, t) => a + (t.entries || 0), 0)}</td></tr>`;
+      out += tasks.length
+        ? tasks.map(t => `<tr class="sub"><td class="sub-name lvl2">${esc(t.task)}</td>` +
+            `${cell(t.hours)}<td class="hours">${t.entries || 0}</td></tr>`).join('')
+        : `<tr class="sub"><td class="sub-name lvl2" colspan="3">No task-level entries.</td></tr>`;
+      return out;
+    }).join('');
+    if (!rows_.length) body = '<tr><td colspan="3" class="muted">No hours logged in this range.</td></tr>';
     view.innerHTML =
       `<div class="drill-head">
          <button class="btn back" id="tochart">← Back to chart</button>
          <h2>${esc(person)}</h2>
        </div>
-       <p class="drill-total">${h2(tot)} h logged of ${h2(cap)} (${pct}%) · ${plural(rows_.length, 'project')}</p>
+       <p class="drill-total">${h2(tot)} h logged of ${h2(cap)} (${pct}%) · ${
+         plural(rows_.length, 'project')} · ${plural(nTasks, 'task')} · ${
+         plural(nEntries, 'time entry', 'time entries')} in ${rangeLabel(dateStart, dateEnd)}</p>
        <table class="tasks">
-         <thead><tr><th>Project</th><th class="hours">Hours</th></tr></thead>
+         <thead><tr><th>Project / Task</th><th class="hours">Hours</th>
+           <th class="hours">Entries</th></tr></thead>
          <tbody>${body}
-           <tr class="parent"><td>All projects</td>${cell(tot)}</tr></tbody>
+           <tr class="parent"><td>All projects</td>${cell(tot)}<td class="hours">${nEntries}</td></tr></tbody>
        </table>`;
     document.getElementById('tochart').onclick = renderTeamActual;
   }
@@ -2625,8 +2949,11 @@ async function renderDetail(gid) {
       '<div class="chart-box"><canvas id="chart"></canvas></div>';
     chart = new Chart(document.getElementById('chart'), {
       type:'bar',
+      // Per-bar colors, not one flat blue: the same hue this person has on every other
+      // per-person chart (and in the Graph Colors tab).
       data:{ labels, datasets:[{ label:'Remaining hours', data:barHours,
-        backgroundColor:C.blue, borderColor:C.blueD, borderWidth:1, _people:people }] },
+        backgroundColor:labels.map(personColor), borderColor:labels.map(personColor),
+        borderWidth:1, _people:people }] },
       options:{ responsive:true, maintainAspectRatio:false,
         onClick:(evt, els) => { if (els.length) showTasks(labels[els[0].index]); },
         onHover:(evt, els) => { evt.native.target.style.cursor = els.length ? 'pointer' : 'default'; },
@@ -2737,8 +3064,11 @@ async function renderLoggedDetail(gid) {
     destroyCharts();
     chart = new Chart(document.getElementById('chart'), {
       type:'bar',
+      // Per-bar colors, not one flat green: each person keeps the hue they carry on every
+      // other per-person chart (and in the Graph Colors tab).
       data:{ labels:data.labels, datasets:[
-        { label:'Hours logged', data:data.hours, backgroundColor:C.green, borderColor:C.greenD,
+        { label:'Hours logged', data:data.hours,
+          backgroundColor:data.labels.map(personColor), borderColor:data.labels.map(personColor),
           borderWidth:1 } ] },
       options:{ responsive:true, maintainAspectRatio:false,
         onClick:(evt, els) => { if (els.length) showEntries(data.labels[els[0].index]); },
@@ -2792,12 +3122,126 @@ async function renderLoggedDetail(gid) {
   load(false);
 }
 
+// A combined budget bucket (e.g. CMD) on its own page: every member project in one chart
+// against the shared monthly cap, so a PM can see which member is eating the bucket.
+// Reads the range the dashboard was left on (no picker here, same as the other detail pages).
+async function renderGroupDetail(name) {
+  app.innerHTML = `
+    <div class="layout">
+      ${sidebarHtml()}
+      <main class="content">
+        <div id="crumbs" class="crumbs">${LOADING}</div>
+        <div class="head">
+          <h1 id="page-title"></h1>
+          <div class="head-right">
+            <span id="dash-updated" class="dash-updated"></span>
+            <button class="btn" id="refresh">Refresh</button>
+          </div>
+        </div>
+        <p class="sub" id="sub"></p>
+        <div id="view">${note(LOADING)}</div>
+      </main>
+    </div>`;
+  wireSidebar(null);
+  const toDash = () => { location.hash = ''; };
+  const btn = document.getElementById('refresh');
+
+  function show(g) {
+    const view = document.getElementById('view');
+    setCrumbs([{label:'Dashboard', fn:toDash}, {label:g.name}]);
+    const used = Number(g.hours || 0), cap = Number(g.cap || 0), left = r2(cap - used);
+    const members = [...g.members].sort((a, b) => (b.hours || 0) - (a.hours || 0));
+    view.innerHTML = summaryBar([
+      { n: h2(cap) + ' h', l: 'Capacity h/mo' },
+      { n: h2(used) + ' h', l: 'Hours used' },
+      { n: h2(left) + ' h', l: left < 0 ? 'Over budget' : 'Remaining', neg: left < 0 },
+      { n: (cap ? (used / cap * 100).toFixed(0) : '0') + '%', l: 'Budget used' },
+      { n: members.length, l: members.length === 1 ? 'Project' : 'Projects' },
+    ]) + `<div class="cap-wide">${capBar(used, cap)}</div>`;
+    if (!members.some(m => (m.hours || 0) > 0)) {
+      view.insertAdjacentHTML('beforeend',
+        noteBox(`No hours logged against ${g.name} in ${rangeLabel(dateStart, dateEnd)}.`));
+      return;
+    }
+    view.insertAdjacentHTML('beforeend', '<div class="chart-box"><canvas id="chart"></canvas></div>');
+    const labels = members.map(m => m.name), hours = members.map(m => r2(m.hours || 0));
+    destroyCharts();
+    chart = new Chart(document.getElementById('chart'), {
+      type:'bar',
+      // Each bar keeps the project's own stable color, so a member reads the same here as in
+      // the Team Capacity donuts.
+      data:{ labels, datasets:[{ label:'Hours logged', data:hours,
+        backgroundColor:labels.map(projectColor), borderColor:labels.map(projectColor),
+        borderWidth:1, _m:members }] },
+      options:{ responsive:true, maintainAspectRatio:false,
+        onClick:(evt, els) => { if (els.length) location.hash = '#/logged/' + members[els[0].index].gid; },
+        onHover:(evt, els) => { evt.native.target.style.cursor = els.length ? 'pointer' : 'default'; },
+        plugins:{ legend:{display:false},
+          tooltip:{ callbacks:{
+            label: ctx => `Logged: ${h2(ctx.parsed.y)} h`,
+            afterLabel: ctx => { const m = ctx.dataset._m[ctx.dataIndex];
+              return `${plural(m.nentries || 0, 'time entry', 'time entries')} · ` +
+                `${used ? (m.hours / used * 100).toFixed(0) : '0'}% of the bucket`; } } } },
+        scales:{ x:{ title:{display:true,text:'Project'},
+                     ticks:{ callback:(v,i) => [labels[i], h2(hours[i]) + ' h'] } },
+                 y:{ beginAtZero:true, title:{display:true,text:'Hours logged'},
+                     ticks:{ callback:v => h2(v) } } } }
+    });
+    const rows = members.map(m =>
+      `<tr class="parent" data-gid="${m.gid}"><td>${esc(m.name)}</td>` +
+      `<td class="hours">${h2(m.hours)} h</td>` +
+      `<td class="hours">${used ? (m.hours / used * 100).toFixed(0) : '0'}%</td>` +
+      `<td class="hours">${cap ? (m.hours / cap * 100).toFixed(0) : '0'}%</td>` +
+      `<td class="hours">${m.nentries || 0}</td></tr>`).join('');
+    view.insertAdjacentHTML('beforeend',
+      `<h2 class="section-h">Member projects</h2>
+       <table class="tasks">
+         <thead><tr><th>Project</th><th class="hours">Hours logged</th>
+           <th class="hours">Share of bucket</th><th class="hours">Of capacity</th>
+           <th class="hours">Entries</th></tr></thead>
+         <tbody>${rows}</tbody>
+       </table>`);
+    view.querySelectorAll('tr.parent[data-gid]').forEach(r =>
+      r.onclick = () => { location.hash = '#/logged/' + r.dataset.gid; });
+  }
+
+  async function load(refresh) {
+    btn.disabled = true; btn.textContent = refresh ? 'Refreshing…' : 'Refresh';
+    try {
+      const q = `?start=${dateStart}&end=${dateEnd}` + (refresh ? '&refresh=1' : '');
+      const [groups, logged] = await Promise.all([
+        fetch('/api/groups').then(r => r.json()),
+        fetch('/api/logged' + q).then(r => r.json()),
+      ]);
+      const cfg = (groups || []).find(g => g.name === name);
+      if (!cfg) {
+        setCrumbs([{label:'Dashboard', fn:toDash}, {label:name}]);
+        document.getElementById('page-title').textContent = name;
+        document.getElementById('view').innerHTML = note('No budget group named ' + name + '.');
+        return;
+      }
+      const g = buildGroupSummary(cfg, logged);
+      document.getElementById('page-title').textContent = g.name;
+      document.getElementById('sub').textContent =
+        `Combined monthly bucket · ${plural(g.members.length, 'project')} · ` +
+        `hours logged ${rangeLabel(dateStart, dateEnd)}`;
+      document.getElementById('dash-updated').textContent = g.updated ? ('Updated ' + g.updated) : '';
+      show(g);
+    } catch (e) { document.getElementById('view').innerHTML = fmtErr(e); }
+    finally { btn.disabled = false; btn.textContent = 'Refresh'; }
+  }
+  btn.onclick = () => load(true);
+  load(false);
+}
+
 function route() {
   destroyCharts();
   let m = location.hash.match(/^#\/logged\/(\d+)/);
   if (m) return renderLoggedDetail(m[1]);
   m = location.hash.match(/^#\/p\/(\d+)/);
   if (m) return renderDetail(m[1]);
+  m = location.hash.match(/^#\/grp\/(.+)$/);
+  if (m) return renderGroupDetail(decodeURIComponent(m[1]));
   renderDashboard();
 }
 window.addEventListener('hashchange', route);
@@ -2881,7 +3325,11 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     url = f"http://localhost:{PORT}"
+    warm = load_entry_cache()
     print(f"Asana dashboard running at {url}  (Ctrl+C to stop)")
+    if warm:
+        print(f"Time-entry cache warm for {warm} tasks — only tasks whose tracked time changed "
+              f"will be re-read. Click Refresh to force a full re-read.")
     webbrowser.open(url)
     ThreadingHTTPServer(("localhost", PORT), Handler).serve_forever()
 

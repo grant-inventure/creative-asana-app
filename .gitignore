@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+# Time-entry cache written at runtime so a restart doesn't re-read every task from Asana.
+.entries_cache.json

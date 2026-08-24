@@ -37,7 +37,7 @@ script works on GitHub Pages and throws a `ReferenceError` locally. The UI scrip
 
 ## Configuration lives at the top of `creative_asana_app.py`
 
-`PROJECTS`, `GROUPS`, `EST_FIELD`, `EXCLUDE_SECTIONS`, `ASSIGNEE_HOURS_CAP`, `TEAM_MEMBERS`,
+`PROJECTS`, `GROUPS`, `EXCLUDE_ESTIMATED`, `EST_FIELD`, `EXCLUDE_SECTIONS`, `ASSIGNEE_HOURS_CAP`, `TEAM_MEMBERS`,
 `DEFAULT_START`/`DEFAULT_END`. `build_static.py` imports these and injects them into the static
 build, so **adding a project or team member is a one-line change plus a rebuild.** Never
 duplicate a project list or a team roster anywhere else.
@@ -45,6 +45,10 @@ duplicate a project list or a team roster anywhere else.
 - A project's `cap` is its **monthly hour capacity**; omit it for projects with no budget.
 - `GROUPS` are several projects sharing one combined monthly cap (e.g. CMD). Members still
   appear individually in every other tab.
+- `EXCLUDE_ESTIMATED` is the set of project gids dropped from every **Estimated Hours** view
+  (they still appear in Actual Hours). `EST_PROJECTS` is `PROJECTS` minus that set — the
+  estimated aggregations (`get_summaries`, `get_assignee_load` / `getSummaries`,
+  `getAssigneeLoad`) map over it, the logged ones over all of `PROJECTS`.
 
 ## Running it
 
@@ -165,11 +169,18 @@ existing `capLinePlugin` / `capMarksPlugin` and are enabled per-chart through
   gzip, retry 429/5xx, and follow pagination. Never hand-roll a `urllib.request` call or a
   `while next_page` loop.
 - **Many small reads of the same shape go through `api_batch()`**, which posts them to Asana's
-  `/batch_requests` `BATCH_MAX` (10) at a time — the per-task time-entry reads were ~90% of a
+  `/batch_requests` `BATCH_MAX` (10) at a time — the per-task time-entry reads are ~90% of a
   load. Batching is an optimization only: a rejected batch, a failed action, or a response with
   a `next_page` falls back to a plain GET for that path, so it can cost requests but must never
-  lose rows. Keep that fallback if you touch it. Console prints per-route call counts
+  lose rows. Keep that fallback if you touch it. **Note: `/batch_requests` returns 404 on this
+  workspace**, so in practice the fallback is the live path; the code probes once, warns, and
+  disables batching for the session. Console prints per-route call counts
   (`/api/logged  48 Asana calls`) — use it to check a change actually reduced requests.
+- **The binding constraint is Asana's per-token rate limit** (1500 requests/minute on paid
+  plans, 150 on free), not connections or thread count. Every call passes a token bucket
+  (`_take_token`, 20/sec ≈ 1200/min) that halves itself on a 429. So the only way to make a load
+  meaningfully faster is to **make fewer calls** — raising concurrency past the limit just
+  earns 429s.
 - **Fetch a project's tasks once.** `fetch_tree(gid)` returns `{tasks, subs}` and is shared by
   the estimated and logged-hours paths (single-flighted per project, so the two concurrent
   startup requests can't duplicate it); `entries_for_task(gid)` caches time entries, which are
