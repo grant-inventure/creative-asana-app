@@ -345,10 +345,15 @@ async function getAssigneeLoad(refresh){
 // Mirrors entries_for_tasks. The per-task entry reads are the bulk of every load and Asana's
 // rate limit puts a hard floor under a few hundred of them, so they're cached in localStorage
 // and only re-read when they can have changed: a task's `actual_time_minutes` IS the sum of its
-// time entries, so an unchanged total means unchanged entries. Any task whose total moved is
-// always re-fetched, and Refresh re-reads everything. Entries also don't depend on the selected
-// range, so changing the range only re-filters what's already here.
-const ENTRY_STORE = 'asanaEntries.v1', ENTRY_STORE_MAX = 8000;
+// time entries, so an unchanged total means no entry was added or deleted. Any task whose total
+// moved is always re-fetched, and Refresh re-reads everything. Entries also don't depend on the
+// selected range, so changing the range only re-filters what's already here.
+// The total does NOT move when an existing entry is *edited*, and its date is the field that
+// gets edited — Asana's log-time dialog defaults to today, so time logged a day late is
+// routinely corrected afterwards, and a stale row would report the old day forever. So the
+// total is only trusted for tasks whose entries are all older than ENTRY_RECHECK_DAYS; anything
+// recent is re-read every load, which bounds the extra calls to the tasks being worked on.
+const ENTRY_STORE = 'asanaEntries.v1', ENTRY_STORE_MAX = 8000, ENTRY_RECHECK_DAYS = 14;
 let _entries = (() => {
   try {
     const blob = JSON.parse(localStorage.getItem(ENTRY_STORE) || 'null');
@@ -372,12 +377,17 @@ function saveEntryCache(){
     try { localStorage.removeItem(ENTRY_STORE); } catch (e2) {}
   }
 }
+// True if any cached entry is dated on/after `cutoff` — i.e. still open to being edited.
+function hasRecent(rows, cutoff){
+  return (rows || []).some(r => (r.entered_on || '') >= cutoff);
+}
 // minutesByGid: { task gid: tracked minutes }
 async function entriesForTasks(minutesByGid, refresh){
   const out = {}, missing = [];
+  const cutoff = new Date(Date.now() - ENTRY_RECHECK_DAYS * 864e5).toISOString().slice(0, 10);
   for (const [g, minutes] of Object.entries(minutesByGid)){
     const e = _entries[g];
-    if (!refresh && e && e.minutes === minutes) out[g] = e.rows;
+    if (!refresh && e && e.minutes === minutes && !hasRecent(e.rows, cutoff)) out[g] = e.rows;
     else missing.push(g);
   }
   if (missing.length){

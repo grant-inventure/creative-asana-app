@@ -23,7 +23,7 @@ import urllib.error
 import urllib.parse
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Each entry becomes a clickable widget on the dashboard.
@@ -696,6 +696,7 @@ def get_assignee_load(refresh=False):
 ENTRY_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".entries_cache.json")
 ENTRY_CACHE_VERSION = 1
 ENTRY_CACHE_MAX = 8000           # tasks; oldest fetches are dropped past this
+ENTRY_RECHECK_DAYS = 14          # a cached task with an entry this recent is always re-read
 _ENTRY_CACHE_DIRTY = [False]
 _ENTRY_CACHE_IO = threading.Lock()
 
@@ -743,6 +744,11 @@ def save_entry_cache():
                 pass
 
 
+def _has_recent(rows, cutoff):
+    """True if any cached entry is dated on/after `cutoff` — i.e. still open to being edited."""
+    return any((r.get("entered_on") or "") >= cutoff for r in rows)
+
+
 def entries_for_tasks(minutes_by_gid, refresh=False):
     """Time entries for many tasks -> {task gid: rows}. Input is {task gid: tracked minutes}.
 
@@ -751,11 +757,20 @@ def entries_for_tasks(minutes_by_gid, refresh=False):
     only re-read when they can have changed:
 
     a task's `actual_time_minutes` IS the sum of its time entries, so an unchanged total means
-    unchanged entries. That invariant is what makes the cache safe to keep across a restart —
-    any task whose total moved is always re-fetched, and Refresh re-reads everything regardless.
-    Entries also don't depend on the selected date range, so changing the range only re-filters.
+    no entry was added or deleted. That invariant is what makes the cache safe to keep across a
+    restart — any task whose total moved is always re-fetched, and Refresh re-reads everything
+    regardless. Entries also don't depend on the selected date range, so changing the range only
+    re-filters.
+
+    The total does NOT move when an existing entry is *edited*, though, and its date is the
+    field that gets edited — Asana's log-time dialog defaults to today, so time logged a day
+    late is routinely corrected afterwards. A stale row would keep reporting the old day
+    forever. So the total is only trusted for tasks whose entries are all older than
+    ENTRY_RECHECK_DAYS; anything with a recent entry is re-read every load. That bounds the
+    extra calls to the tasks actually being worked on.
     """
     out, missing, now = {}, [], time.time()
+    cutoff = (date.today() - timedelta(days=ENTRY_RECHECK_DAYS)).isoformat()
     with CACHE_LOCK:
         for g, minutes in minutes_by_gid.items():
             e = CACHE["entries"].get(g)
@@ -763,8 +778,8 @@ def entries_for_tasks(minutes_by_gid, refresh=False):
                 missing.append(g)
             elif now - e.get("at", 0) < REFRESH_SHARE_WINDOW:
                 out[g] = e["rows"]      # just fetched; don't re-read for a concurrent request
-            elif not refresh and e.get("minutes") == minutes:
-                out[g] = e["rows"]      # total unchanged -> entries unchanged
+            elif not refresh and e.get("minutes") == minutes and not _has_recent(e["rows"], cutoff):
+                out[g] = e["rows"]      # total unchanged, nothing recent -> entries unchanged
             else:
                 missing.append(g)
     if missing:
