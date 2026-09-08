@@ -35,7 +35,7 @@ PROJECTS = [
     {"gid": "1216989200658405", "name": "My Pest Solutions SEO", "cap": 4},
     {"gid": "1214228966572508", "name": "Firebird MSA"},
     {"gid": "1214228966572503", "name": "Myrick Marine"},
-    {"gid": "1214229029715234", "name": "Savannah Bee"},
+    {"gid": "1214229029715234", "name": "Savannah Bee Company"},
     {"gid": "1214228966572536", "name": "CMD: Concierge Clinics"},
     {"gid": "1214228966572531", "name": "CMD: Pathologic"},
     {"gid": "1214228966572526", "name": "CMD: Products"},
@@ -1622,15 +1622,44 @@ function monthRange(now){ const d = now || new Date(), p = n => String(n).padSta
 let [dateStart, dateEnd] = monthRange();
 function fmtDate(d){ const [y,m,day]=d.split('-').map(Number); return new Date(y, m-1, day).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}); }
 function rangeLabel(s, e){ return fmtDate(s) + ' – ' + fmtDate(e); }
-// How far through the *working* part of the selected range today sits. Mon–Fri only, so a
-// month's 30 calendar days become ~22 billable ones; no holiday calendar, so a week with a
-// holiday in it still counts five days. Today counts as elapsed once it starts, which is the
-// reading a PM wants at a glance ("we're 12 of 22 days in").
+// Company holidays (YYYY-MM-DD) that fall on a weekday but are not worked, so they don't
+// count toward the work month. A week with one in it is four days, not five, which pushes the
+// pace target down for everyone instead of quietly marking the team behind. Add a date here
+// as it is announced — the list is only read by workdayProgress.
+// A date that lands on a weekend is harmless to list — it was never a work day — so the
+// published date goes in as-is rather than being shifted to an observed weekday.
+const HOLIDAYS = new Set([
+  '2025-09-01',   // Mon · Labor Day
+  // 2026 calendar, as published.
+  '2026-05-25',   // Mon · Memorial Day
+  '2026-07-04',   // Sat · Independence Day (weekend)
+  '2026-09-07',   // Mon · Labor Day
+  '2026-11-26',   // Thu · Thanksgiving
+  '2026-11-27',   // Fri · day after Thanksgiving
+  '2026-12-24',   // Thu · Christmas Eve
+  '2026-12-25',   // Fri · Christmas Day
+  '2027-01-01',   // Fri · New Year's Day
+  // 2027 extrapolated from the usual rules (last Mon of May, 1st Mon of Sep, 4th Thu of Nov).
+  // Replace these with the published dates when the calendar is announced.
+  '2027-05-31',   // Mon · Memorial Day
+  '2027-07-04',   // Sun · Independence Day (weekend)
+  '2027-09-06',   // Mon · Labor Day
+  '2027-11-25',   // Thu · Thanksgiving
+  '2027-11-26',   // Fri · day after Thanksgiving
+  '2027-12-24',   // Fri · Christmas Eve
+  '2027-12-25',   // Sat · Christmas Day (weekend)
+  '2028-01-01',   // Sat · New Year's Day (weekend)
+]);
+// How far through the *working* part of the selected range today sits. Mon–Fri minus the
+// HOLIDAYS above, so a month's 30 calendar days become ~22 billable ones and a holiday week
+// counts four. Today counts as elapsed once it starts, which is the reading a PM wants at a
+// glance ("we're 12 of 22 days in").
 //   { total, elapsed, left, pct } — pct is 0 before the range opens, 100 once it has closed,
 //   and doubles as the share of the monthly target that should already be logged.
 function workdayProgress(start, end, today){
   const parse = s => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
-  const isWork = d => d.getDay() !== 0 && d.getDay() !== 6;
+  const iso = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  const isWork = d => d.getDay() !== 0 && d.getDay() !== 6 && !HOLIDAYS.has(iso(d));
   const s = parse(start), e = parse(end);
   const now = today || new Date();
   const t = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -1666,7 +1695,7 @@ const TABS = {
   estimated: { label:'Project Cards', title:'Project Cards · Estimated',
     sub:'One card per project: estimated hours still on the board and how many tasks they sit in.' },
   teamactual: { label:'Team Capacity', title:'Team Capacity · Logged',
-    sub:'Hours actually logged per person in the selected range, against the monthly target. The amber line is where each person should be today, based on how far through the work month (Mon–Fri) we are — a bar is green when it is at that line or within 5 h of it, red when it falls further behind.' },
+    sub:'Hours actually logged per person in the selected range, against the monthly target. The amber line is where each person should be today, based on how far through the work month (Mon–Fri, minus holidays) we are — a bar is green when it is at that line or within 5 h of it, red when it falls further behind.' },
   capacity: { label:'MSA Project Capacity', title:'MSA Project Capacity · Logged',
     sub:'Hours logged against each retainer budget for the selected range, with what is left.' },
   actualproj: { label:'Bar Chart', title:'Projects · Logged',
@@ -2610,7 +2639,7 @@ async function renderDashboard() {
     // Headline stats: what the team actually booked against what it could have.
     const totLogged = rows.reduce((a, r) => a + r.total, 0);
     const teamCap = cap * rows.length;
-    // How far through the work month (Mon–Fri) we are, and therefore how many hours each
+    // How far through the work month (Mon–Fri, minus holidays) we are, and therefore how many hours each
     // person should already have logged if they are keeping pace with the monthly target.
     const wp = workdayProgress(dateStart, dateEnd);
     const paceTarget = r2(cap * wp.pct / 100);
