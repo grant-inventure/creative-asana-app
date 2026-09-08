@@ -48,9 +48,10 @@ PROJECTS = [
     {"gid": "1214228966572568", "name": "Brain Dump"},
     {"gid": "1214228966572563", "name": "Internal IIT Backlog"},
     {"gid": "1216154609521581", "name": "NuNu"},
-    {"gid": "1216640931651593", "name": "Ross Wood Website Redesign", "cap": 30},   # one-month cap, not a recurring MSA
+    {"gid": "1216640931651593", "name": "Ross Wood Website Redesign"},   # archived; no further hours budgeted
     {"gid": "1216208009045309", "name": "Marsh and Main"},
     {"gid": "1217239377209835", "name": "Sales"},
+    {"gid": "1217194342869306", "name": "St. Patrick's Day"},
 ]
 
 # Budget groups: several projects that share ONE combined monthly capacity.
@@ -81,6 +82,7 @@ ARCHIVED_GIDS = {
     "1214755322546416",   # Project Twilight
     "1214228966572573",   # Autotask Reporting
     "1214228966572578",   # Claude: Discovery and Engineering
+    "1216640931651593",   # Ross Wood Website Redesign
 }
 # The project list the aggregate estimated views (get_assignee_load) work over. Every other
 # endpoint keeps all of PROJECTS and lets the UI split off the archived section.
