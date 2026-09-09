@@ -629,6 +629,16 @@ def get_summaries(refresh=False):
     return out
 
 
+def sub_burn(t, name):
+    """Time logged on `name`'s subtasks of `t` that carry no estimate of their own.
+    An unestimated subtask is work covered by the parent's estimate, so its logged
+    hours burn the parent task down instead of showing as a negative remainder on
+    the subtask's own row. Subtasks that were estimated separately stay their own
+    bucket. Either way the rows still sum to (estimated − actual) for the person."""
+    return sum(s["actual"] for s in t["subtasks"]
+               if s["assignee"] == name and not s["hours"])
+
+
 def assignee_project_tasks(d, name):
     """The task/subtask rows assigned to `name` within one project detail `d`,
     each with estimated / actual / remaining hours and status (section)."""
@@ -638,14 +648,18 @@ def assignee_project_tasks(d, name):
             rows.append({
                 "name": t["name"], "type": "task", "status": t["section"],
                 "estimated": t["hours"], "actual": t["actual"],
-                "remaining": round(t["hours"] - t["actual"], 2), "context": "",
+                "remaining": round(t["hours"] - t["actual"] - sub_burn(t, name), 2),
+                "context": "",
             })
         for s in t["subtasks"]:
             if s["assignee"] == name:
                 rows.append({
                     "name": s["name"], "type": "subtask", "status": t["section"],
                     "estimated": s["hours"], "actual": s["actual"],
-                    "remaining": round(s["hours"] - s["actual"], 2),
+                    # zero when it has no estimate of its own AND the parent row above is
+                    # this person's, i.e. its hours were burned down against that estimate
+                    "remaining": 0.0 if (not s["hours"] and t["assignee"] == name)
+                                 else round(s["hours"] - s["actual"], 2),
                     # note the parent when this subtask lives under someone else's task
                     "context": "" if t["assignee"] == name else f'under "{t["name"]}" · {t["assignee"]}',
                 })
@@ -3055,16 +3069,21 @@ async function renderDetail(gid) {
     const all = detailData.tasks.filter(estKept);
     // Est / actual / remaining per row, so the column of remaining hours adds up to the bar.
     let rows = '', totEst = 0, totAct = 0, items = 0;
-    const remCell = (est, act) => `<td class="hours">${h2(r2(est - act))} h</td>`;
+    const remCell = rem => `<td class="hours">${h2(r2(rem))} h</td>`;
+    // Time on this assignee's unestimated subtasks of `t`: work covered by the parent's
+    // estimate, so it burns the parent row down rather than showing as a negative remainder
+    // on the subtask row (mirrors sub_burn() server-side).
+    const subBurn = t => t.subtasks.filter(s => s.assignee === assignee && !s.hours)
+                                   .reduce((a, s) => a + (s.actual || 0), 0);
 
-    function subRow(s, context) {
+    function subRow(s, context, burned) {
       totEst += s.hours; totAct += s.actual || 0; items++;
       // Subtasks carry no status column of their own, so the cell states what the row is.
       return `<tr class="sub"><td class="sub-name">${esc(s.name)}${context}</td>` +
         `<td><span class="badge none">Subtask</span></td>` +
         `<td class="hours">${s.hours ? h2(s.hours) + ' h' : '—'}</td>` +
         `<td class="hours">${s.actual ? h2(s.actual) + ' h' : '—'}</td>` +
-        remCell(s.hours, s.actual || 0) + '</tr>';
+        remCell(burned ? 0 : s.hours - (s.actual || 0)) + '</tr>';
     }
 
     // 1. Tasks owned by this assignee, with only THEIR subtasks nested underneath.
@@ -3075,14 +3094,16 @@ async function renderDetail(gid) {
                          : `<span class="badge none">${NO_STATUS}</span>`}</td>` +
         `<td class="hours">${h2(t.hours)} h</td>` +
         `<td class="hours">${h2(t.actual || 0)} h</td>` +
-        remCell(t.hours, t.actual || 0) + '</tr>';
-      t.subtasks.filter(s => s.assignee === assignee).forEach(s => { rows += subRow(s, ''); });
+        remCell(t.hours - (t.actual || 0) - subBurn(t)) + '</tr>';
+      t.subtasks.filter(s => s.assignee === assignee)
+                .forEach(s => { rows += subRow(s, '', !s.hours); });
     });
 
-    // 2. This assignee's subtasks that live under someone else's task.
+    // 2. This assignee's subtasks that live under someone else's task: no parent row of
+    //    theirs to burn down, so these keep their own estimated − actual.
     all.filter(t => t.assignee !== assignee).forEach(t => {
       t.subtasks.filter(s => s.assignee === assignee).forEach(s => {
-        rows += subRow(s, ` <span class="muted">(under "${esc(t.name)}" · ${esc(t.assignee)})</span>`);
+        rows += subRow(s, ` <span class="muted">(under "${esc(t.name)}" · ${esc(t.assignee)})</span>`, false);
       });
     });
 

@@ -309,15 +309,24 @@ async function getSummaries(refresh){
   const details = await mapAll(PROJECTS, p => getDetail(p.gid, refresh));
   return (CACHE.summaries = details.map(summaryFromDetail));
 }
+// Time logged on `name`'s subtasks of `t` that carry no estimate of their own. An unestimated
+// subtask is work covered by the parent's estimate, so its logged hours burn the parent task
+// down instead of showing as a negative remainder on the subtask's own row. Mirrors sub_burn().
+function subBurn(t, name){
+  return sum(t.subtasks.filter(s => s.assignee === name && !s.hours).map(s => s.actual));
+}
 // Task/subtask rows assigned to `name` within one project detail (est/actual/remaining + status).
 function assigneeProjectTasks(d, name){
   const rows = [];
   for (const t of d.tasks){
     if (t.assignee === name)
-      rows.push({ name: t.name, type: 'task', status: t.section, estimated: t.hours, actual: t.actual, remaining: round2(t.hours - t.actual), context: '' });
+      rows.push({ name: t.name, type: 'task', status: t.section, estimated: t.hours, actual: t.actual,
+        remaining: round2(t.hours - t.actual - subBurn(t, name)), context: '' });
     for (const s of t.subtasks){
       if (s.assignee === name)
-        rows.push({ name: s.name, type: 'subtask', status: t.section, estimated: s.hours, actual: s.actual, remaining: round2(s.hours - s.actual),
+        rows.push({ name: s.name, type: 'subtask', status: t.section, estimated: s.hours, actual: s.actual,
+          // zero when it has no estimate of its own AND the parent row above is this person's
+          remaining: (!s.hours && t.assignee === name) ? 0 : round2(s.hours - s.actual),
           context: t.assignee === name ? '' : `under "${t.name}" · ${t.assignee}` });
     }
   }
