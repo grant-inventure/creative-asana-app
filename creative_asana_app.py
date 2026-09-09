@@ -39,7 +39,7 @@ PROJECTS = [
     {"gid": "1214228966572536", "name": "CMD: Concierge Clinics"},
     {"gid": "1214228966572531", "name": "CMD: Pathologic"},
     {"gid": "1214228966572526", "name": "CMD: Products"},
-    {"gid": "1214228966572521", "name": "Georgia Skin & Cancer Clinic"},
+    {"gid": "1214228966572521", "name": "Georgia Skin & Cancer Clinic", "cap": 15},
     {"gid": "1214228966572541", "name": "DocSmith.md MSA", "cap": 24},
     {"gid": "1214228966572551", "name": "Savannah Camellia Fest 2027"},
     {"gid": "1214755322546416", "name": "Project Twilight"},
@@ -64,7 +64,6 @@ GROUPS = [
         "1214228966572531",   # CMD: Pathologic
         "1214228966572526",   # CMD: Products
         "1216154609521581",   # NuNu
-        "1214228966572521",   # Georgia Skin & Cancer Clinic
     ]},
 ]
 
