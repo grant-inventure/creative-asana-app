@@ -234,7 +234,9 @@ function isExcluded(t, gid){ return EXCLUDE_SECTIONS.has(sectionName(t, gid).tri
 // lets fetchTree skip the subtask call for a leaf task, and completed_at is what the
 // logged-hours layer needs, so it no longer re-fetches these same lists.
 const TASK_FIELDS = 'name,assignee.name,completed,completed_at,actual_time_minutes,num_subtasks,custom_fields.name,custom_fields.number_value,memberships.section.name,memberships.project.gid';
-const SUBTASK_FIELDS = 'name,assignee.name,completed,completed_at,actual_time_minutes,custom_fields.name,custom_fields.number_value';
+// A subtask carries its own memberships, so it gets its own status column when it has been
+// added to the project — never inherit the parent's section for it.
+const SUBTASK_FIELDS = 'name,assignee.name,completed,completed_at,actual_time_minutes,custom_fields.name,custom_fields.number_value,memberships.section.name,memberships.project.gid';
 function fetchTasks(gid){ return asanaGet(`/projects/${gid}/tasks?opt_fields=${TASK_FIELDS}&limit=100`); }
 const subtasksPath = g => `/tasks/${g}/subtasks?opt_fields=${SUBTASK_FIELDS}&limit=100`;
 const entriesPath = g => `/tasks/${g}/time_tracking_entries?opt_fields=duration_minutes,entered_on,created_by.name&limit=100`;
@@ -258,9 +260,12 @@ function fetchTree(gid, refresh){
 function buildTask(t, gid, children){
   const subs = [];
   for (const s of children){
-    if (s.completed) continue;
+    // completed subtasks (checked off or in an excluded column) don't count
+    if (s.completed || isExcluded(s, gid)) continue;
     subs.push({ name: s.name || '(untitled)', assignee: (s.assignee || {}).name || 'Unassigned',
-      hours: round2(taskMinutes(s) / 60), actual: round2(actualMinutes(s) / 60) });
+      hours: round2(taskMinutes(s) / 60), actual: round2(actualMinutes(s) / 60),
+      // the subtask's OWN status column; '' when it isn't a member of the project
+      section: sectionName(s, gid) });
   }
   return { gid: t.gid, name: t.name || '(untitled)', assignee: (t.assignee || {}).name || 'Unassigned',
     hours: round2(taskMinutes(t) / 60), actual: round2(actualMinutes(t) / 60), section: sectionName(t, gid), subtasks: subs };
@@ -324,7 +329,7 @@ function assigneeProjectTasks(d, name){
         remaining: round2(t.hours - t.actual - subBurn(t, name)), context: '' });
     for (const s of t.subtasks){
       if (s.assignee === name)
-        rows.push({ name: s.name, type: 'subtask', status: t.section, estimated: s.hours, actual: s.actual,
+        rows.push({ name: s.name, type: 'subtask', status: s.section, estimated: s.hours, actual: s.actual,
           // zero when it has no estimate of its own AND the parent row above is this person's
           remaining: (!s.hours && t.assignee === name) ? 0 : round2(s.hours - s.actual),
           context: t.assignee === name ? '' : `under "${t.name}" · ${t.assignee}` });

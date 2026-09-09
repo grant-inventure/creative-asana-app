@@ -403,8 +403,11 @@ def api_batch(paths):
 TASK_FIELDS = ("name,assignee.name,completed,completed_at,actual_time_minutes,num_subtasks,"
                "custom_fields.name,custom_fields.number_value,"
                "memberships.section.name,memberships.project.gid")
+# A subtask carries its own memberships, so it gets its own status column when it has been
+# added to the project — never inherit the parent's section for it.
 SUBTASK_FIELDS = ("name,assignee.name,completed,completed_at,actual_time_minutes,"
-                  "custom_fields.name,custom_fields.number_value")
+                  "custom_fields.name,custom_fields.number_value,"
+                  "memberships.section.name,memberships.project.gid")
 
 
 def fetch_tasks(gid):
@@ -527,8 +530,8 @@ def build_task(t, gid, children):
     parent_min = task_minutes(t)
     subs, sub_min = [], 0
     for s in children:
-        if s.get("completed"):
-            continue  # completed subtasks are not shown or counted
+        if s.get("completed") or is_excluded(s, gid):
+            continue  # completed subtasks (checked off or in an excluded column) don't count
         m = task_minutes(s)
         sub_min += m
         subs.append({
@@ -536,6 +539,8 @@ def build_task(t, gid, children):
             "assignee": (s.get("assignee") or {}).get("name") or "Unassigned",
             "hours": round(m / 60, 2),
             "actual": round(actual_minutes(s) / 60, 2),
+            # the subtask's OWN status column; '' when it isn't a member of the project
+            "section": section_name(s, gid),
         })
     return {
         "gid": t["gid"],
@@ -654,7 +659,7 @@ def assignee_project_tasks(d, name):
         for s in t["subtasks"]:
             if s["assignee"] == name:
                 rows.append({
-                    "name": s["name"], "type": "subtask", "status": t["section"],
+                    "name": s["name"], "type": "subtask", "status": s["section"],
                     "estimated": s["hours"], "actual": s["actual"],
                     # zero when it has no estimate of its own AND the parent row above is
                     # this person's, i.e. its hours were burned down against that estimate
@@ -3078,9 +3083,11 @@ async function renderDetail(gid) {
 
     function subRow(s, context, burned) {
       totEst += s.hours; totAct += s.actual || 0; items++;
-      // Subtasks carry no status column of their own, so the cell states what the row is.
+      // A subtask's own status column when it has one (never the parent's); otherwise the
+      // cell falls back to stating what the row is.
       return `<tr class="sub"><td class="sub-name">${esc(s.name)}${context}</td>` +
-        `<td><span class="badge none">Subtask</span></td>` +
+        `<td>${s.section ? `<span class="badge">${esc(s.section)}</span>`
+                         : '<span class="badge none">Subtask</span>'}</td>` +
         `<td class="hours">${s.hours ? h2(s.hours) + ' h' : '—'}</td>` +
         `<td class="hours">${s.actual ? h2(s.actual) + ' h' : '—'}</td>` +
         remCell(burned ? 0 : s.hours - (s.actual || 0)) + '</tr>';
